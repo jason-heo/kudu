@@ -86,6 +86,9 @@ class TabletServiceImpl : public TabletServerServiceIf {
   bool SupportsFeature(uint32_t feature) const override;
 
   virtual void Shutdown() OVERRIDE;
+  virtual void ClearCache(const ClearCacheRequestPB* req,
+                          ClearCacheResponsePB* resp,
+                          rpc::RpcContext* context) OVERRIDE;
 
  private:
   Status HandleNewScanRequest(tablet::TabletPeer* tablet_peer,

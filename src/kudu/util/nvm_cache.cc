@@ -203,6 +203,7 @@ class NvmLRUCache {
   Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool caching);
   void Release(Cache::Handle* handle);
   void Erase(const Slice& key, uint32_t hash);
+  void ClearCache();
   void* AllocateAndRetry(size_t size);
 
  private:
@@ -252,14 +253,7 @@ NvmLRUCache::NvmLRUCache(VMEM* vmp)
 }
 
 NvmLRUCache::~NvmLRUCache() {
-  for (LRUHandle* e = lru_.next; e != &lru_; ) {
-    LRUHandle* next = e->next;
-    DCHECK_EQ(e->refs, 1);  // Error if caller has an unreleased handle
-    if (Unref(e)) {
-      FreeEntry(e);
-    }
-    e = next;
-  }
+  ClearCache();
 }
 
 void* NvmLRUCache::VmemMalloc(size_t size) {
@@ -451,6 +445,18 @@ void NvmLRUCache::Erase(const Slice& key, uint32_t hash) {
     FreeEntry(e);
   }
 }
+
+void NvmLRUCache::ClearCache() {
+  for (LRUHandle* e = lru_.next; e != &lru_; ) {
+    LRUHandle* next = e->next;
+    DCHECK_EQ(e->refs, 1);  // Error if caller has an unreleased handle
+    if (Unref(e)) {
+      FreeEntry(e);
+    }
+    e = next;
+  }
+}
+
 static const int kNumShardBits = 4;
 static const int kNumShards = 1 << kNumShardBits;
 
@@ -555,6 +561,12 @@ class ShardedLRUCache : public Cache {
 
   virtual void Free(PendingHandle* ph) OVERRIDE {
     vmem_free(vmp_, ph);
+  }
+
+  virtual void ClearCache() OVERRIDE {
+    for (NvmLRUCache* cache : shards_) {
+      cache->ClearCache();
+    }
   }
 };
 

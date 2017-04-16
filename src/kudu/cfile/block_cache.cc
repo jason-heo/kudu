@@ -93,5 +93,9 @@ void BlockCache::StartInstrumentation(const scoped_refptr<MetricEntity>& metric_
   cache_->SetMetrics(metric_entity);
 }
 
+void BlockCache::ClearCache() {
+  cache_->ClearCache();
+}
+
 } // namespace cfile
 } // namespace kudu

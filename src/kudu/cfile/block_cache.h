@@ -151,6 +151,7 @@ class BlockCache {
   // Insert the given block into the cache. 'inserted' is set to refer to the
   // entry in the cache.
   void Insert(PendingEntry* entry, BlockCacheHandle* inserted);
+  void ClearCache();
 
  private:
   friend class Singleton<BlockCache>;

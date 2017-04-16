@@ -198,6 +198,11 @@ class Cache {
   // Free 'ptr', which must have been previously allocated using 'Allocate'.
   virtual void Free(PendingHandle* ptr) = 0;
 
+  // Clear Cache
+  // 
+  // Cache will be cleared.
+  virtual void ClearCache() = 0;
+
  private:
   DISALLOW_COPY_AND_ASSIGN(Cache);
 };

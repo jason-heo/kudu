@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "kudu/cfile/block_cache.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
@@ -1935,6 +1936,12 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   RETURN_NOT_OK(tablet->NewRowIterator(projection, snap, scan_pb.order_mode(), iter));
   *snap_timestamp = tmp_snap_timestamp;
   return Status::OK();
+}
+
+void TabletServiceImpl::ClearCache(const ClearCacheRequestPB* /*req*/,
+                                   ClearCacheResponsePB* /*resp*/,
+                                   rpc::RpcContext* context) {
+  cfile::BlockCache::GetSingleton()->ClearCache();
 }
 
 } // namespace tserver

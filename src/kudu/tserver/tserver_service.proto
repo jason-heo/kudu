@@ -51,6 +51,9 @@ service TabletServerService {
   rpc Checksum(ChecksumRequestPB) returns (ChecksumResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
+  rpc ClearCache(ClearCacheRequestPB) returns (ClearCacheResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
+  }
 }
 
 message ChecksumRequestPB {

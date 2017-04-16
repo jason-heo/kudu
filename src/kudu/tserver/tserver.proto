@@ -369,3 +369,9 @@ enum TabletServerFeatures {
   UNKNOWN_FEATURE = 0;
   COLUMN_PREDICATES = 1;
 }
+message ClearCacheRequestPB {
+}
+
+message ClearCacheResponsePB {
+}
+

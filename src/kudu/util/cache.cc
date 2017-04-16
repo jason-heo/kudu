@@ -188,6 +188,7 @@ class LRUCache {
   Cache::Handle* Lookup(const Slice& key, uint32_t hash, bool caching);
   void Release(Cache::Handle* handle);
   void Erase(const Slice& key, uint32_t hash);
+  void ClearCache();
 
  private:
   void LRU_Remove(LRUHandle* e);
@@ -226,14 +227,7 @@ LRUCache::LRUCache(MemTracker* tracker)
 }
 
 LRUCache::~LRUCache() {
-  for (LRUHandle* e = lru_.next; e != &lru_; ) {
-    LRUHandle* next = e->next;
-    DCHECK_EQ(e->refs, 1);  // Error if caller has an unreleased handle
-    if (Unref(e)) {
-      FreeEntry(e);
-    }
-    e = next;
-  }
+  ClearCache();
 }
 
 bool LRUCache::Unref(LRUHandle* e) {
@@ -378,6 +372,18 @@ void LRUCache::Erase(const Slice& key, uint32_t hash) {
   }
 }
 
+// Free all the items cached
+void LRUCache::ClearCache() {
+  for (LRUHandle* e = lru_.next; e != &lru_; ) {
+    LRUHandle* next = e->next;
+    DCHECK_EQ(e->refs, 1);  // Error if caller has an unreleased handle
+    if (Unref(e)) {
+      FreeEntry(e);
+    }
+    e = next;
+  }
+}
+
 // Determine the number of bits of the hash that should be used to determine
 // the cache shard. This, in turn, determines the number of shards.
 int DetermineShardBits() {
@@ -486,6 +492,12 @@ class ShardedLRUCache : public Cache {
   virtual void Free(PendingHandle* h) OVERRIDE {
     uint8_t* data = reinterpret_cast<uint8_t*>(h);
     delete [] data;
+  }
+
+  virtual void ClearCache() OVERRIDE {
+    for (LRUCache* cache : shards_) {
+      cache->ClearCache();
+    }
   }
 
   virtual uint8_t* MutableValue(PendingHandle* h) OVERRIDE {

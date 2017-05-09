@@ -63,11 +63,13 @@ using consensus::GetLastOpIdResponsePB;
 using consensus::LeaderStepDownRequestPB;
 using consensus::LeaderStepDownResponsePB;
 using consensus::OpId;
+using consensus::OpIdType;
 using consensus::RaftPeerPB;
 using consensus::RunLeaderElectionResponsePB;
 using consensus::RunLeaderElectionRequestPB;
 using consensus::kInvalidOpIdIndex;
 using master::ListTabletServersResponsePB;
+using master::ListTabletServersResponsePB_Entry;
 using master::MasterServiceProxy;
 using master::TabletLocationsPB;
 using rpc::Messenger;
@@ -109,7 +111,7 @@ client::KuduSchema SimpleIntKeyKuduSchema() {
 
 Status GetLastOpIdForEachReplica(const string& tablet_id,
                                  const vector<TServerDetails*>& replicas,
-                                 consensus::OpIdType opid_type,
+                                 OpIdType opid_type,
                                  const MonoDelta& timeout,
                                  vector<OpId>* op_ids) {
   GetLastOpIdRequestPB opid_req;
@@ -137,7 +139,7 @@ Status GetLastOpIdForEachReplica(const string& tablet_id,
 
 Status GetLastOpIdForReplica(const std::string& tablet_id,
                              TServerDetails* replica,
-                             consensus::OpIdType opid_type,
+                             OpIdType opid_type,
                              const MonoDelta& timeout,
                              consensus::OpId* op_id) {
   vector<OpId> op_ids;
@@ -145,6 +147,42 @@ Status GetLastOpIdForReplica(const std::string& tablet_id,
   CHECK_EQ(1, op_ids.size());
   *op_id = op_ids[0];
   return Status::OK();
+}
+
+Status WaitForOpFromCurrentTerm(TServerDetails* replica,
+                                const string& tablet_id,
+                                OpIdType opid_type,
+                                const MonoDelta& timeout,
+                                OpId* opid) {
+  const MonoTime kStart = MonoTime::Now();
+  const MonoTime kDeadline = kStart + timeout;
+
+  Status s;
+  while (MonoTime::Now() < kDeadline) {
+    ConsensusStatePB cstate;
+    s = GetConsensusState(replica, tablet_id, CONSENSUS_CONFIG_ACTIVE, kDeadline - MonoTime::Now(),
+                          &cstate);
+    if (s.ok()) {
+      OpId tmp_opid;
+      s = GetLastOpIdForReplica(tablet_id, replica, opid_type, kDeadline - MonoTime::Now(),
+                                &tmp_opid);
+      if (s.ok()) {
+        if (tmp_opid.term() == cstate.current_term()) {
+          if (opid) {
+            opid->Swap(&tmp_opid);
+          }
+          return Status::OK();
+        }
+        s = Status::IllegalState(Substitute("Terms don't match. Current term: $0. Latest OpId: $1",
+                                 cstate.current_term(), OpIdToString(tmp_opid)));
+      }
+    }
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  }
+
+  return Status::TimedOut(Substitute("Timed out after $0 waiting for op from current term: $1",
+                                     (MonoTime::Now() - kStart).ToString(),
+                                     s.ToString()));
 }
 
 Status WaitForServersToAgree(const MonoDelta& timeout,
@@ -229,21 +267,15 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
                                      log_index, passed.ToString(), replicas_str));
 }
 
-Status CreateTabletServerMap(MasterServiceProxy* master_proxy,
+Status CreateTabletServerMap(const shared_ptr<MasterServiceProxy>& master_proxy,
                              const shared_ptr<Messenger>& messenger,
                              unordered_map<string, TServerDetails*>* ts_map) {
-  master::ListTabletServersRequestPB req;
-  master::ListTabletServersResponsePB resp;
-  rpc::RpcController controller;
-
-  RETURN_NOT_OK(master_proxy->ListTabletServers(req, &resp, &controller));
-  RETURN_NOT_OK(controller.status());
-  if (resp.has_error()) {
-    return Status::RemoteError("Response had an error", SecureShortDebugString(resp.error()));
-  }
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  vector<ListTabletServersResponsePB_Entry> tservers;
+  RETURN_NOT_OK(ListTabletServers(master_proxy, kTimeout, &tservers));
 
   ts_map->clear();
-  for (const ListTabletServersResponsePB::Entry& entry : resp.servers()) {
+  for (const auto& entry : tservers) {
     HostPort host_port;
     RETURN_NOT_OK(HostPortFromPB(entry.registration().rpc_addresses(0), &host_port));
     vector<Sockaddr> addresses;
@@ -311,10 +343,10 @@ Status WaitUntilCommittedConfigNumVotersIs(int config_size,
     if (MonoTime::Now() > start + timeout) {
       break;
     }
-    SleepFor(MonoDelta::FromMilliseconds(1 << backoff_exp));
+    SleepFor(MonoDelta::FromMilliseconds(1LLU << backoff_exp));
     backoff_exp = min(backoff_exp + 1, kMaxBackoffExp);
   }
-  return Status::TimedOut(Substitute("Number of voters does not equal $0 after waiting for $1."
+  return Status::TimedOut(Substitute("Number of voters does not equal $0 after waiting for $1. "
                                      "Last consensus state: $2. Last status: $3",
                                      config_size, timeout.ToString(),
                                      SecureShortDebugString(cstate), s.ToString()));
@@ -345,6 +377,41 @@ Status WaitUntilCommittedConfigOpIdIndexIs(int64_t opid_index,
                                      opid_index,
                                      (MonoTime::Now() - start).ToString(),
                                      SecureShortDebugString(cstate), s.ToString()));
+}
+
+Status ListTabletServers(
+    const shared_ptr<MasterServiceProxy>& master_proxy,
+    const MonoDelta& timeout,
+    vector<ListTabletServersResponsePB_Entry>* tservers) {
+  master::ListTabletServersRequestPB req;
+  master::ListTabletServersResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(timeout);
+
+  RETURN_NOT_OK(master_proxy->ListTabletServers(req, &resp, &controller));
+  RETURN_NOT_OK(controller.status());
+  if (resp.has_error()) {
+    return Status::RemoteError("Response had an error", SecureShortDebugString(resp.error()));
+  }
+  tservers->assign(resp.servers().begin(), resp.servers().end());
+  return Status::OK();
+}
+
+Status WaitForNumTabletServers(
+    const shared_ptr<MasterServiceProxy>& master_proxy,
+    int num_servers, const MonoDelta& timeout) {
+  const MonoTime kStartTime = MonoTime::Now();
+  const MonoTime kDeadline = kStartTime + timeout;
+  vector<ListTabletServersResponsePB_Entry> tservers;
+  while (MonoTime::Now() < kDeadline) {
+    RETURN_NOT_OK(ListTabletServers(master_proxy, kDeadline - MonoTime::Now(), &tservers));
+    if (tservers.size() >= num_servers) return Status::OK();
+    SleepFor(MonoDelta::FromMilliseconds(50));
+  }
+
+  return Status::TimedOut(Substitute(
+      "Timed out waiting for $0 tablet servers to be registered with the master. Found $1",
+      num_servers, tservers.size()));
 }
 
 Status WaitForReplicasReportedToMaster(
@@ -457,7 +524,7 @@ Status WaitUntilLeader(const TServerDetails* replica,
     if (MonoTime::Now() > deadline) {
       break;
     }
-    SleepFor(MonoDelta::FromMilliseconds(1 << backoff_exp));
+    SleepFor(MonoDelta::FromMilliseconds(1LLU << backoff_exp));
     backoff_exp = min(backoff_exp + 1, kMaxBackoffExp);
   }
   return Status::TimedOut(Substitute("Replica $0 is not leader after waiting for $1: $2",

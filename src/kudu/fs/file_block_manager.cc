@@ -18,11 +18,13 @@
 #include "kudu/fs/file_block_manager.h"
 
 #include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 
 #include "kudu/fs/block_manager_metrics.h"
 #include "kudu/fs/data_dirs.h"
+#include "kudu/fs/fs_report.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/atomic.h"
@@ -36,6 +38,7 @@
 #include "kudu/util/random_util.h"
 #include "kudu/util/status.h"
 
+using std::accumulate;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
@@ -223,6 +226,8 @@ class FileWritableBlock : public WritableBlock {
 
   virtual Status Append(const Slice& data) OVERRIDE;
 
+  virtual Status AppendV(const vector<Slice>& data) OVERRIDE;
+
   virtual Status FlushDataAsync() OVERRIDE;
 
   virtual size_t BytesAppended() const OVERRIDE;
@@ -296,14 +301,23 @@ const BlockId& FileWritableBlock::id() const {
 }
 
 Status FileWritableBlock::Append(const Slice& data) {
-  DCHECK(state_ == CLEAN || state_ == DIRTY)
-      << "Invalid state: " << state_;
+  return AppendV({ data });
+}
 
-  RETURN_NOT_OK(writer_->Append(data));
+Status FileWritableBlock::AppendV(const vector<Slice>& data) {
+  DCHECK(state_ == CLEAN || state_ == DIRTY)
+  << "Invalid state: " << state_;
+  RETURN_NOT_OK(writer_->AppendV(data));
   RETURN_NOT_OK(location_.data_dir()->RefreshIsFull(
       DataDir::RefreshMode::ALWAYS));
   state_ = DIRTY;
-  bytes_appended_ += data.size();
+
+  // Calculate the amount of data written
+  size_t bytes_written = accumulate(data.begin(), data.end(), static_cast<size_t>(0),
+                                    [&](int sum, const Slice& curr) {
+                                      return sum + curr.size();
+                                    });
+  bytes_appended_ += bytes_written;
   return Status::OK();
 }
 
@@ -381,8 +395,9 @@ class FileReadableBlock : public ReadableBlock {
 
   virtual Status Size(uint64_t* sz) const OVERRIDE;
 
-  virtual Status Read(uint64_t offset, size_t length,
-                      Slice* result, uint8_t* scratch) const OVERRIDE;
+  virtual Status Read(uint64_t offset, Slice* result) const OVERRIDE;
+
+  virtual Status ReadV(uint64_t offset, vector<Slice>* results) const OVERRIDE;
 
   virtual size_t memory_footprint() const OVERRIDE;
 
@@ -442,13 +457,23 @@ Status FileReadableBlock::Size(uint64_t* sz) const {
   return reader_->Size(sz);
 }
 
-Status FileReadableBlock::Read(uint64_t offset, size_t length,
-                               Slice* result, uint8_t* scratch) const {
+Status FileReadableBlock::Read(uint64_t offset, Slice* result) const {
+  vector<Slice> results = { *result };
+  return ReadV(offset, &results);
+}
+
+Status FileReadableBlock::ReadV(uint64_t offset, vector<Slice>* results) const {
   DCHECK(!closed_.Load());
 
-  RETURN_NOT_OK(env_util::ReadFully(reader_.get(), offset, length, result, scratch));
+  RETURN_NOT_OK(reader_->ReadV(offset, results));
+
   if (block_manager_->metrics_) {
-    block_manager_->metrics_->total_bytes_read->IncrementBy(length);
+    // Calculate the read amount of data
+    size_t bytes_read = accumulate(results->begin(), results->end(), static_cast<size_t>(0),
+                                   [&](int sum, const Slice& curr) {
+                                     return sum + curr.size();
+                                   });
+    block_manager_->metrics_->total_bytes_read->IncrementBy(bytes_read);
   }
 
   return Status::OK();
@@ -535,7 +560,7 @@ Status FileBlockManager::Create() {
       FLAGS_enable_data_block_fsync ? DataDirManager::FLAG_CREATE_FSYNC : 0);
 }
 
-Status FileBlockManager::Open() {
+Status FileBlockManager::Open(FsReport* report) {
   DataDirManager::LockMode mode;
   if (!FLAGS_block_manager_lock_dirs) {
     mode = DataDirManager::LockMode::NONE;
@@ -548,6 +573,18 @@ Status FileBlockManager::Open() {
 
   if (file_cache_) {
     RETURN_NOT_OK(file_cache_->Init());
+  }
+
+  // Prepare the filesystem report and either return or log it.
+  FsReport local_report;
+  for (const auto& dd : dd_manager_.data_dirs()) {
+    // TODO(adar): probably too expensive to fill out the stats/checks.
+    local_report.data_dirs.push_back(dd->dir());
+  }
+  if (report) {
+    *report = std::move(local_report);
+  } else {
+    RETURN_NOT_OK(local_report.LogAndCheckForFatalErrors());
   }
   return Status::OK();
 }

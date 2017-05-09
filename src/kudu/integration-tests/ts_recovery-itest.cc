@@ -84,7 +84,7 @@ void TsRecoveryITest::StartCluster(const vector<string>& extra_tserver_flags,
   ExternalMiniClusterOptions opts;
   opts.num_tablet_servers = num_tablet_servers;
   opts.extra_tserver_flags = extra_tserver_flags;
-  cluster_.reset(new ExternalMiniCluster(opts));
+  cluster_.reset(new ExternalMiniCluster(std::move(opts)));
   ASSERT_OK(cluster_->Start());
 }
 
@@ -275,10 +275,10 @@ TEST_F(TsRecoveryITest, TestChangeMaxCellSize) {
   std::unordered_map<std::string, itest::TServerDetails*> ts_map;
   ValueDeleter del(&ts_map);
 
-  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
+  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy(),
                                          cluster_->messenger(),
                                          &ts_map));
-  AssertEventually([&]() {
+  ASSERT_EVENTUALLY([&]() {
       vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
       ASSERT_OK(ListTablets(ts_map[ts->uuid()], MonoDelta::FromSeconds(10), &tablets));
       ASSERT_EQ(1, tablets.size());
@@ -320,7 +320,7 @@ TEST_F(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
 
   std::unordered_map<std::string, itest::TServerDetails*> ts_map;
   ValueDeleter del(&ts_map);
-  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
+  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy(),
                                          cluster_->messenger(),
                                          &ts_map));
   vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
@@ -376,7 +376,7 @@ TEST_F(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
   ASSERT_OK(cluster_->Restart());
 
   OpId last_written_opid;
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     // Tablet bootstrap should have converted the negative OpIds to positive ones.
     ASSERT_OK(itest::GetLastOpIdForReplica(tablet_id, ts, RECEIVED_OPID, MonoDelta::FromSeconds(5),
                                            &last_written_opid));
@@ -386,7 +386,6 @@ TEST_F(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
     expected_opid.set_index(static_cast<int64_t>(INT32_MAX) + kNumOverflowedEntriesToWrite);
     ASSERT_OPID_EQ(expected_opid, last_written_opid);
   });
-  NO_FATALS();
 
   // Now, write some records that will have a higher opid than INT32_MAX and
   // ensure they get written. This checks for overflows in the write path.
@@ -405,7 +404,7 @@ TEST_F(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
 
   // Validate.
   OpId prev_written_opid = last_written_opid;
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     ASSERT_OK(itest::GetLastOpIdForReplica(tablet_id, ts, RECEIVED_OPID, MonoDelta::FromSeconds(5),
                                            &last_written_opid));
     ASSERT_TRUE(last_written_opid.IsInitialized());
@@ -415,7 +414,6 @@ TEST_F(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
     ASSERT_GT(last_written_opid.term(), prev_written_opid.term());
     ASSERT_GT(last_written_opid.index(), prev_written_opid.index());
   });
-  NO_FATALS();
   NO_FATALS(cluster_->AssertNoCrashes());
 }
 
@@ -525,7 +523,7 @@ TEST_P(Kudu969Test, Test) {
   // concurrency bugs where a compaction and a flush might be happening
   // at the same time during the crash.
   opts.extra_tserver_flags.push_back("--maintenance_manager_num_threads=3");
-  cluster_.reset(new ExternalMiniCluster(opts));
+  cluster_.reset(new ExternalMiniCluster(std::move(opts)));
   ASSERT_OK(cluster_->Start());
 
   // Set a small flush threshold so that we flush a lot (causing more compactions

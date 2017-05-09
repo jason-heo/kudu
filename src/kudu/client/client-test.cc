@@ -56,7 +56,7 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/server/hybrid_clock.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/transactions/write_transaction.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/scanners.h"
@@ -117,7 +117,7 @@ using master::GetTableLocationsRequestPB;
 using master::GetTableLocationsResponsePB;
 using master::TabletLocationsPB;
 using sp::shared_ptr;
-using tablet::TabletPeer;
+using tablet::TabletReplica;
 using tserver::MiniTabletServer;
 
 class ClientTest : public KuduTest {
@@ -240,10 +240,10 @@ class ClientTest : public KuduTest {
 
   void FlushTablet(const string& tablet_id) {
     for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-      scoped_refptr<TabletPeer> tablet_peer;
+      scoped_refptr<TabletReplica> tablet_replica;
       ASSERT_TRUE(cluster_->mini_tablet_server(i)->server()->tablet_manager()->LookupTablet(
-          tablet_id, &tablet_peer));
-      ASSERT_OK(tablet_peer->tablet()->Flush());
+          tablet_id, &tablet_replica));
+      ASSERT_OK(tablet_replica->tablet()->Flush());
     }
   }
 
@@ -351,7 +351,7 @@ class ClientTest : public KuduTest {
   void DoTestScanResourceMetrics() {
     KuduScanner scanner(client_table_.get());
     string tablet_id = GetFirstTabletId(client_table_.get());
-    // flush to ensure we scan disk later
+    // Flush to ensure we scan disk later
     FlushTablet(tablet_id);
     ASSERT_OK(scanner.SetProjectedColumns({ "key" }));
     LOG_TIMING(INFO, "Scanning disk with no predicates") {
@@ -763,8 +763,8 @@ TEST_F(ClientTest, TestScanAtSnapshot) {
   ASSERT_NO_FATAL_FAILURE(InsertTestRows(client_table_.get(),
                                          half_the_rows));
 
-  // get the time from the server and transform to micros disregarding any
-  // logical values (we shouldn't have any with a single server anyway);
+  // Get the time from the server and transform to micros, disregarding any
+  // logical values (we shouldn't have any with a single server anyway).
   int64_t ts = server::HybridClock::GetPhysicalValueMicros(
       cluster_->mini_tablet_server(0)->server()->clock()->Now());
 
@@ -1342,7 +1342,7 @@ TEST_F(ClientTest, TestNonCoveringRangePartitions) {
 
   // Scans
 
-  { // full table scan
+  { // Full table scan
     vector<string> rows;
     KuduScanner scanner(table.get());
     ASSERT_OK(scanner.SetFaultTolerant());
@@ -1419,6 +1419,71 @@ TEST_F(ClientTest, TestNonCoveringRangePartitions) {
 
     ASSERT_EQ(0, rows.size());
   }
+}
+
+// Test that OpenTable calls clear cached non-covered range partitions.
+TEST_F(ClientTest, TestOpenTableClearsNonCoveringRangePartitions) {
+  // Create a table with a non-covered range.
+  const string kTableName = "TestNonCoveringRangePartitions";
+  shared_ptr<KuduTable> table;
+
+  vector<pair<unique_ptr<KuduPartialRow>, unique_ptr<KuduPartialRow>>> bounds;
+  unique_ptr<KuduPartialRow> lower_bound(schema_.NewRow());
+  unique_ptr<KuduPartialRow> upper_bound(schema_.NewRow());
+  ASSERT_OK(lower_bound->SetInt32("key", 0));
+  ASSERT_OK(upper_bound->SetInt32("key", 1));
+  bounds.emplace_back(std::move(lower_bound), std::move(upper_bound));
+
+  CreateTable(kTableName, 1, {}, std::move(bounds), &table);
+
+  // Attempt to insert into the non-covered range, priming the meta cache.
+  shared_ptr<KuduSession> session = client_->NewSession();
+  ASSERT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_SYNC));
+  ASSERT_TRUE(session->Apply(BuildTestRow(table.get(), 1).release()).IsIOError());
+  {
+    vector<KuduError*> errors;
+    ElementDeleter drop(&errors);
+    bool overflowed;
+    session->GetPendingErrors(&errors, &overflowed);
+    EXPECT_FALSE(overflowed);
+    ASSERT_EQ(1, errors.size());
+    EXPECT_TRUE(errors[0]->status().IsNotFound());
+  }
+
+  // Using a separate client, fill in the non-covered range. A separate client
+  // is necessary because altering the range partitioning will automatically
+  // clear the meta cache, and we want to avoid that.
+
+  lower_bound.reset(schema_.NewRow());
+  upper_bound.reset(schema_.NewRow());
+  ASSERT_OK(lower_bound->SetInt32("key", 1));
+
+  shared_ptr<KuduClient> alter_client;
+  ASSERT_OK(KuduClientBuilder()
+      .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr().ToString())
+      .Build(&alter_client));
+
+  unique_ptr<KuduTableAlterer> alterer(alter_client->NewTableAlterer(kTableName));
+  ASSERT_OK(alterer->AddRangePartition(lower_bound.release(), upper_bound.release())
+                   ->Alter());
+
+  // Attempt to insert again into the non-covered range. It should still fail,
+  // because the meta cache still contains the non-covered entry.
+  ASSERT_TRUE(session->Apply(BuildTestRow(table.get(), 1).release()).IsIOError());
+  {
+    vector<KuduError*> errors;
+    ElementDeleter drop(&errors);
+    bool overflowed;
+    session->GetPendingErrors(&errors, &overflowed);
+    EXPECT_FALSE(overflowed);
+    ASSERT_EQ(1, errors.size());
+    EXPECT_TRUE(errors[0]->status().IsNotFound());
+  }
+
+  // Re-open the table, and attempt to insert again.  This time the meta cache
+  // should clear non-covered entries, and the insert should succeed.
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  ASSERT_OK(session->Apply(BuildTestRow(table.get(), 1).release()));
 }
 
 TEST_F(ClientTest, TestExclusiveInclusiveRangeBounds) {
@@ -3039,7 +3104,7 @@ TEST_F(ClientTest, TestMutateDeletedRow) {
   Status s = session->Flush();
   ASSERT_FALSE(s.ok());
   ASSERT_STR_CONTAINS(s.ToString(), "Some errors occurred");
-  // verify error
+  // Verify error
   gscoped_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
   ASSERT_EQ(error->failed_op().ToString(),
             "UPDATE int32 key=1, int32 int_val=2");
@@ -3051,7 +3116,7 @@ TEST_F(ClientTest, TestMutateDeletedRow) {
   s = session->Flush();
   ASSERT_FALSE(s.ok());
   ASSERT_STR_CONTAINS(s.ToString(), "Some errors occurred");
-  // verify error
+  // Verify error
   error = GetSingleErrorFromSession(session.get());
   ASSERT_EQ(error->failed_op().ToString(),
             "DELETE int32 key=1");
@@ -3069,7 +3134,7 @@ TEST_F(ClientTest, TestMutateNonexistentRow) {
   Status s = session->Flush();
   ASSERT_FALSE(s.ok());
   ASSERT_STR_CONTAINS(s.ToString(), "Some errors occurred");
-  // verify error
+  // Verify error
   gscoped_ptr<KuduError> error = GetSingleErrorFromSession(session.get());
   ASSERT_EQ(error->failed_op().ToString(),
             "UPDATE int32 key=1, int32 int_val=2");
@@ -3081,7 +3146,7 @@ TEST_F(ClientTest, TestMutateNonexistentRow) {
   s = session->Flush();
   ASSERT_FALSE(s.ok());
   ASSERT_STR_CONTAINS(s.ToString(), "Some errors occurred");
-  // verify error
+  // Verify error
   error = GetSingleErrorFromSession(session.get());
   ASSERT_EQ(error->failed_op().ToString(),
             "DELETE int32 key=1");
@@ -3207,42 +3272,6 @@ TEST_F(ClientTest, TestWriteWithBadSchema) {
 TEST_F(ClientTest, TestBasicAlterOperations) {
   const vector<string> kBadNames = {"", string(1000, 'x')};
 
-  // test that having no steps throws an error
-  {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    Status s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "No alter steps provided");
-  }
-
-  // test that adding a non-nullable column with no default value throws an error
-  {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull();
-    Status s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "column `key`: NOT NULL columns must have a default");
-  }
-
-  // test that remove key should throws an error
-  {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    Status s = table_alterer
-      ->DropColumn("key")
-      ->Alter();
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "cannot remove a key column");
-  }
-
-  // test that renaming to an already-existing name throws an error
-  {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AlterColumn("int_val")->RenameTo("string_val");
-    Status s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsAlreadyPresent());
-    ASSERT_STR_CONTAINS(s.ToString(), "The column already exists: string_val");
-  }
-
   // Test that renaming a column to an invalid name throws an error.
   for (const string& bad_name : kBadNames) {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
@@ -3275,22 +3304,93 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
                         "permitted maximum 300");
   }
 
-  // Need a tablet peer for the next set of tests.
+  // Having no steps should throw an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "No alter steps provided");
+  }
+
+  // Adding a non-nullable column with no default value should throw an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull();
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(), "column `key`: NOT NULL columns must have a default");
+  }
+
+  // Removing a key should throw an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    Status s = table_alterer
+      ->DropColumn("key")
+      ->Alter();
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "cannot remove a key column: key");
+  }
+
+  // Renaming a column to an already-existing name should throw an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("int_val")->RenameTo("string_val");
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsAlreadyPresent());
+    ASSERT_STR_CONTAINS(s.ToString(), "The column already exists: string_val");
+  }
+
+  // Altering a column but specifying no alterations should throw an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val");
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "no alter operation specified: string_val");
+  }
+
+  // Trying to change the type of a column is an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val")->Type(KuduColumnSchema::STRING);
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsNotSupported());
+    ASSERT_STR_CONTAINS(s.ToString(), "unsupported alter operation: string_val");
+  }
+
+  // Trying to alter the nullability of a column is an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val")->Nullable();
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsNotSupported());
+    ASSERT_STR_CONTAINS(s.ToString(), "unsupported alter operation: string_val");
+  }
+
+  // Trying to alter the nullability of a column is an error.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val")->NotNull();
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsNotSupported());
+    ASSERT_STR_CONTAINS(s.ToString(), "unsupported alter operation: string_val");
+  }
+
+  // Need a TabletReplica for the next set of tests.
   string tablet_id = GetFirstTabletId(client_table_.get());
-  scoped_refptr<TabletPeer> tablet_peer;
+  scoped_refptr<TabletReplica> tablet_replica;
   ASSERT_TRUE(cluster_->mini_tablet_server(0)->server()->tablet_manager()->LookupTablet(
-      tablet_id, &tablet_peer));
+      tablet_id, &tablet_replica));
 
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->DropColumn("int_val")
       ->AddColumn("new_col")->Type(KuduColumnSchema::INT32);
     ASSERT_OK(table_alterer->Alter());
-    ASSERT_EQ(1, tablet_peer->tablet()->metadata()->schema_version());
+    ASSERT_EQ(1, tablet_replica->tablet()->metadata()->schema_version());
   }
 
-  // test that specifying an encoding incompatible with the column's
-  // type throws an error
+  // Specifying an encoding incompatible with the column's type is an error.
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AddColumn("new_string_val")->Type(KuduColumnSchema::STRING)
@@ -3298,46 +3398,130 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     Status s = table_alterer->Alter();
     ASSERT_TRUE(s.IsNotSupported());
     ASSERT_STR_CONTAINS(s.ToString(), "encoding GROUP_VARINT not supported for type BINARY");
-    ASSERT_EQ(1, tablet_peer->tablet()->metadata()->schema_version());
+    ASSERT_EQ(1, tablet_replica->tablet()->metadata()->schema_version());
   }
 
-  // test that adds a new column of type string
+  // Test adding a new column of type string.
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AddColumn("new_string_val")->Type(KuduColumnSchema::STRING)
       ->Encoding(KuduColumnStorageAttributes::PREFIX_ENCODING);
     ASSERT_OK(table_alterer->Alter());
-    ASSERT_EQ(2, tablet_peer->tablet()->metadata()->schema_version());
+    ASSERT_EQ(2, tablet_replica->tablet()->metadata()->schema_version());
   }
 
-  // test renaming primary key column
+  // Test renaming a primary key column.
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AlterColumn("key")->RenameTo("key2");
     Status s = table_alterer->Alter();
     ASSERT_FALSE(s.IsInvalidArgument());
-    ASSERT_EQ(3, tablet_peer->tablet()->metadata()->schema_version());
+    ASSERT_EQ(3, tablet_replica->tablet()->metadata()->schema_version());
   }
 
-  // test that changing the data type of a primary key column throws an error
+  // Changing the type of a primary key column is an error.
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AlterColumn("key2")->Type(KuduColumnSchema::INT64)->NotNull()->PrimaryKey();
     Status s = table_alterer->Alter();
     ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "Not implemented: cannot alter attributes for column: key2");
+                        "Not implemented: unsupported alter operation: key2");
   }
 
-  // test that changes table name
+  // Test changing a default value for a variable-length (string) column.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val")
+        ->Default(KuduValue::CopyString("hello!"));
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(4, tablet_replica->tablet()->metadata()->schema_version());
+    Schema schema = tablet_replica->tablet()->metadata()->schema();
+    ColumnSchema col_schema = schema.column(schema.find_column("string_val"));
+    ASSERT_FALSE(col_schema.has_read_default());
+    ASSERT_TRUE(col_schema.has_write_default());
+    ASSERT_EQ("hello!", *reinterpret_cast<const Slice*>(col_schema.write_default_value()));
+  }
+
+  // Test changing a default value for an integer column.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("non_null_with_default")
+        ->Default(KuduValue::FromInt(54321));
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(5, tablet_replica->tablet()->metadata()->schema_version());
+    Schema schema = tablet_replica->tablet()->metadata()->schema();
+    ColumnSchema col_schema = schema.column(schema.find_column("non_null_with_default"));
+    ASSERT_TRUE(col_schema.has_read_default()); // Started with a default
+    ASSERT_TRUE(col_schema.has_write_default());
+    ASSERT_EQ(54321, *reinterpret_cast<const int32_t*>(col_schema.write_default_value()));
+  }
+
+  // Test clearing a default value from a nullable column.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val")
+        ->RemoveDefault();
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(6, tablet_replica->tablet()->metadata()->schema_version());
+    Schema schema = tablet_replica->tablet()->metadata()->schema();
+    ColumnSchema col_schema = schema.column(schema.find_column("string_val"));
+    ASSERT_FALSE(col_schema.has_read_default());
+    ASSERT_FALSE(col_schema.has_write_default());
+  }
+
+  // Test clearing a default value from a non-nullable column.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("non_null_with_default")
+        ->RemoveDefault();
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(7, tablet_replica->tablet()->metadata()->schema_version());
+    Schema schema = tablet_replica->tablet()->metadata()->schema();
+    ColumnSchema col_schema = schema.column(schema.find_column("non_null_with_default"));
+    ASSERT_TRUE(col_schema.has_read_default());
+    ASSERT_FALSE(col_schema.has_write_default());
+  }
+
+  // Test that specifying a default of the wrong size fails.
+  // Since the column's type isn't checked client-side and the client
+  // stores defaults for all integer-backed types as 64-bit integers, the client
+  // client can request defaults of the wrong type or size for a column's type.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("non_null_with_default")
+        ->Default(KuduValue::CopyString("aaa"));
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "wrong size for default value");
+    ASSERT_EQ(7, tablet_replica->tablet()->metadata()->schema_version());
+  }
+
+  // Test altering encoding, compression, and block size.
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("string_val")
+        ->Encoding(KuduColumnStorageAttributes::PLAIN_ENCODING)
+        ->Compression(KuduColumnStorageAttributes::LZ4)
+        ->BlockSize(16 * 1024 * 1024);
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(8, tablet_replica->tablet()->metadata()->schema_version());
+    Schema schema = tablet_replica->tablet()->metadata()->schema();
+    ColumnSchema col_schema = schema.column(schema.find_column("string_val"));
+    ASSERT_EQ(KuduColumnStorageAttributes::PLAIN_ENCODING, col_schema.attributes().encoding);
+    ASSERT_EQ(KuduColumnStorageAttributes::LZ4, col_schema.attributes().compression);
+    ASSERT_EQ(16 * 1024 * 1024, col_schema.attributes().cfile_block_size);
+  }
+
+  // Test changing a table name.
   {
     const char *kRenamedTableName = "RenamedTable";
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     ASSERT_OK(table_alterer
               ->RenameTo(kRenamedTableName)
               ->Alter());
-    ASSERT_EQ(4, tablet_peer->tablet()->metadata()->schema_version());
-    ASSERT_EQ(kRenamedTableName, tablet_peer->tablet()->metadata()->table_name());
+    ASSERT_EQ(9, tablet_replica->tablet()->metadata()->schema_version());
+    ASSERT_EQ(kRenamedTableName, tablet_replica->tablet()->metadata()->table_name());
 
     CatalogManager *catalog_manager = cluster_->mini_master()->master()->catalog_manager();
     CatalogManager::ScopedLeaderSharedLock l(catalog_manager);
@@ -3377,9 +3561,9 @@ TEST_F(ClientTest, TestDeleteTable) {
   int wait_time = 1000;
   bool tablet_found = true;
   for (int i = 0; i < 80 && tablet_found; ++i) {
-    scoped_refptr<TabletPeer> tablet_peer;
+    scoped_refptr<TabletReplica> tablet_replica;
     tablet_found = cluster_->mini_tablet_server(0)->server()->tablet_manager()->LookupTablet(
-                      tablet_id, &tablet_peer);
+                      tablet_id, &tablet_replica);
     SleepFor(MonoDelta::FromMicroseconds(wait_time));
     wait_time = std::min(wait_time * 5 / 4, 1000000);
   }
@@ -4074,9 +4258,9 @@ TEST_F(ClientTest, TestInsertEmptyPK) {
   ASSERT_OK(client_->OpenTable(kTableName, &table));
 
   // Find the tablet.
-  scoped_refptr<TabletPeer> tablet_peer;
+  scoped_refptr<TabletReplica> tablet_replica;
   ASSERT_TRUE(cluster_->mini_tablet_server(0)->server()->tablet_manager()->LookupTablet(
-          GetFirstTabletId(table.get()), &tablet_peer));
+          GetFirstTabletId(table.get()), &tablet_replica));
 
   // Utility function to get the current value of the row.
   const auto ReadRowAsString = [&]() {
@@ -4101,7 +4285,7 @@ TEST_F(ClientTest, TestInsertEmptyPK) {
   ASSERT_EQ("(string k1=\"\", string v1=\"initial\")", ReadRowAsString());
 
   // Make sure that Flush works properly, and the data is still readable.
-  ASSERT_OK(tablet_peer->tablet()->Flush());
+  ASSERT_OK(tablet_replica->tablet()->Flush());
   ASSERT_EQ("(string k1=\"\", string v1=\"initial\")", ReadRowAsString());
 
   // Perform an update.
@@ -4113,9 +4297,9 @@ TEST_F(ClientTest, TestInsertEmptyPK) {
     ASSERT_OK(session->Flush());
   }
   ASSERT_EQ("(string k1=\"\", string v1=\"updated\")", ReadRowAsString());
-  ASSERT_OK(tablet_peer->tablet()->FlushAllDMSForTests());
+  ASSERT_OK(tablet_replica->tablet()->FlushAllDMSForTests());
   ASSERT_EQ("(string k1=\"\", string v1=\"updated\")", ReadRowAsString());
-  ASSERT_OK(tablet_peer->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
+  ASSERT_OK(tablet_replica->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
   ASSERT_EQ("(string k1=\"\", string v1=\"updated\")", ReadRowAsString());
 
   // Perform a delete.
@@ -4126,9 +4310,9 @@ TEST_F(ClientTest, TestInsertEmptyPK) {
     ASSERT_OK(session->Flush());
   }
   ASSERT_EQ("<none>", ReadRowAsString());
-  ASSERT_OK(tablet_peer->tablet()->FlushAllDMSForTests());
+  ASSERT_OK(tablet_replica->tablet()->FlushAllDMSForTests());
   ASSERT_EQ("<none>", ReadRowAsString());
-  ASSERT_OK(tablet_peer->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
+  ASSERT_OK(tablet_replica->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
   ASSERT_EQ("<none>", ReadRowAsString());
 }
 
@@ -5045,6 +5229,27 @@ TEST_F(ClientTest, TestInvalidPartitionerBuilder) {
   s = KuduPartitionerBuilder(sp::shared_ptr<KuduTable>())
       .Build(&part);
   ASSERT_EQ("Invalid argument: null table", s.ToString());
+}
+
+// Test that, log verbose level can be set through environment varialble
+// and it reflects to the FLAGS_v.
+TEST_F(ClientTest, TestVerboseLevelByEnvVar) {
+  FLAGS_v = 0;
+  setenv(kVerboseEnvVar, "5", 1); // 1 = overwrite if variable already exists.
+  SetVerboseLevelFromEnvVar();
+  ASSERT_EQ(5, FLAGS_v);
+
+  // negative values are to be ignored.
+  FLAGS_v = 0;
+  setenv(kVerboseEnvVar, "-1", 1);
+  SetVerboseLevelFromEnvVar();
+  ASSERT_EQ(0, FLAGS_v);
+
+  // non-parsable values are to be ignored.
+  FLAGS_v = 0;
+  setenv(kVerboseEnvVar, "abc", 1);
+  SetVerboseLevelFromEnvVar();
+  ASSERT_EQ(0, FLAGS_v);
 }
 
 } // namespace client

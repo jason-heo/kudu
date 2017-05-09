@@ -50,6 +50,7 @@ class RWFile;
 class ThreadPool;
 
 namespace fs {
+struct FsReport;
 
 namespace internal {
 class LogBlock;
@@ -166,7 +167,7 @@ class LogBlockManager : public BlockManager {
 
   Status Create() override;
 
-  Status Open() override;
+  Status Open(FsReport* report) override;
 
   Status CreateBlock(const CreateBlockOptions& opts,
                      std::unique_ptr<WritableBlock>* block) override;
@@ -237,15 +238,18 @@ class LogBlockManager : public BlockManager {
 
   // Adds a LogBlock to in-memory data structures.
   //
-  // Returns success if the LogBlock was successfully added, failure if it
-  // was already present.
-  bool AddLogBlock(internal::LogBlockContainer* container,
-                   const BlockId& block_id,
-                   int64_t offset,
-                   int64_t length);
+  // Returns the created LogBlock if it was successfully added or nullptr if a
+  // block with that ID was already present.
+  scoped_refptr<internal::LogBlock> AddLogBlock(
+      internal::LogBlockContainer* container,
+      const BlockId& block_id,
+      int64_t offset,
+      int64_t length);
 
   // Unlocked variant of AddLogBlock() for an already-constructed LogBlock object.
   // Must hold 'lock_'.
+  //
+  // Returns true if the LogBlock was successfully added, false if it was already present.
   bool AddLogBlockUnlocked(const scoped_refptr<internal::LogBlock>& lb);
 
   // Removes a LogBlock from in-memory data structures.
@@ -254,18 +258,21 @@ class LogBlockManager : public BlockManager {
   // already gone.
   scoped_refptr<internal::LogBlock> RemoveLogBlock(const BlockId& block_id);
 
-  // Parses a block record, adding or removing it in 'block_map', and
-  // accounting for it in the metadata for 'container'.
+  // Repairs any inconsistencies described in 'report'. Any blocks in
+  // 'need_repunching' will be punched out again.
   //
-  // Returns a bad status if the record is malformed in some way.
-  Status ProcessBlockRecord(const BlockRecordPB& record,
-                            internal::LogBlockContainer* container,
-                            UntrackedBlockMap* block_map);
+  // Returns an error if repairing a fatal inconsistency failed.
+  Status Repair(FsReport* report,
+                std::vector<scoped_refptr<internal::LogBlock>> need_repunching);
 
-  // Open a particular data directory belonging to the block manager.
+  // Opens a particular data directory belonging to the block manager. The
+  // results of consistency checking (and repair, if applicable) are written to
+  // 'report'.
   //
   // Success or failure is set in 'result_status'.
-  void OpenDataDir(DataDir* dir, Status* result_status);
+  void OpenDataDir(DataDir* dir,
+                   FsReport* report,
+                   Status* result_status);
 
   // Perform basic initialization.
   Status Init();
@@ -321,7 +328,8 @@ class LogBlockManager : public BlockManager {
   BlockIdSet open_block_ids_;
 
   // Holds (and owns) all containers loaded from disk.
-  std::vector<internal::LogBlockContainer*> all_containers_;
+  std::unordered_map<std::string,
+                     internal::LogBlockContainer*> all_containers_by_name_;
 
   // Holds only those containers that are currently available for writing,
   // excluding containers that are either in use or full.

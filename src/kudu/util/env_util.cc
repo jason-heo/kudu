@@ -153,42 +153,6 @@ Status VerifySufficientDiskSpace(Env *env, const std::string& path,
   return Status::OK();
 }
 
-Status ReadFully(RandomAccessFile* file, uint64_t offset, size_t n,
-                 Slice* result, uint8_t* scratch) {
-
-  bool first_read = true;
-
-  int rem = n;
-  uint8_t* dst = scratch;
-  while (rem > 0) {
-    Slice this_result;
-    RETURN_NOT_OK(file->Read(offset, rem, &this_result, dst));
-    DCHECK_LE(this_result.size(), rem);
-    if (this_result.size() == 0) {
-      // EOF
-      return Status::IOError(Substitute("EOF trying to read $0 bytes at offset $1",
-                                        n, offset));
-    }
-
-    if (first_read && this_result.size() == n) {
-      // If it's the first read, we can return a zero-copy array.
-      *result = this_result;
-      return Status::OK();
-    }
-    first_read = false;
-
-    // Otherwise, we're going to have to do more reads and stitch
-    // each read together.
-    this_result.relocate(dst);
-    dst += this_result.size();
-    rem -= this_result.size();
-    offset += this_result.size();
-  }
-  DCHECK_EQ(0, rem);
-  *result = Slice(scratch, n);
-  return Status::OK();
-}
-
 Status CreateDirIfMissing(Env* env, const string& path, bool* created) {
   Status s = env->CreateDir(path);
   if (created != nullptr) {
@@ -235,8 +199,8 @@ Status CopyFile(Env* env, const string& source_path, const string& dest_path,
   uint64_t bytes_read = 0;
   while (bytes_read < size) {
     uint64_t max_bytes_to_read = std::min<uint64_t>(size - bytes_read, kBufferSize);
-    Slice data;
-    RETURN_NOT_OK(source->Read(max_bytes_to_read, &data, scratch.get()));
+    Slice data(scratch.get(), max_bytes_to_read);
+    RETURN_NOT_OK(source->Read(&data));
     RETURN_NOT_OK(dest->Append(data));
     bytes_read += data.size();
   }

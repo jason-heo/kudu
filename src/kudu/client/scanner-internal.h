@@ -46,8 +46,12 @@ struct ScanRpcStatus {
     // The request was malformed (e.g. bad schema, etc).
     INVALID_REQUEST,
 
-    // The server was busy (e.g. RPC queue overflow).
-    SERVER_BUSY,
+    // The server received the request but it was not ready to serve it right
+    // away. It might happen that the server was too busy and did not have
+    // necessary resources or information to serve the request but it
+    // anticipates it should be ready to serve the request really soon, so it's
+    // worth retrying the request at a later time.
+    SERVICE_UNAVAILABLE,
 
     // The deadline for the whole batch was exceeded.
     OVERALL_DEADLINE_EXCEEDED,
@@ -256,6 +260,7 @@ class KuduScanBatch::Data {
   Status Reset(rpc::RpcController* controller,
                const Schema* projection,
                const KuduSchema* client_projection,
+               uint64_t row_format_flags,
                gscoped_ptr<RowwiseRowBlockPB> resp_data);
 
   int num_rows() const {
@@ -263,6 +268,9 @@ class KuduScanBatch::Data {
   }
 
   KuduRowResult row(int idx) {
+    DCHECK_EQ(row_format_flags_, KuduScanner::NO_FLAGS)
+        << "Cannot decode individual rows. Row format flags were set: "
+        << row_format_flags_;
     DCHECK_GE(idx, 0);
     DCHECK_LT(idx, num_rows());
     int offset = idx * projected_row_size_;
@@ -292,6 +300,10 @@ class KuduScanBatch::Data {
   const Schema* projection_;
   // The KuduSchema version of 'projection_'
   const KuduSchema* client_projection_;
+
+  // The row format flags that were passed to the KuduScanner.
+  // See: KuduScanner::SetRowFormatFlags()
+  uint64_t row_format_flags_;
 
   // The number of bytes of direct data for each row.
   size_t projected_row_size_;

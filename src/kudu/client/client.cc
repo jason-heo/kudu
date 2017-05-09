@@ -18,6 +18,7 @@
 #include "kudu/client/client.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <string>
@@ -55,6 +56,7 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
@@ -126,6 +128,7 @@ using internal::MetaCache;
 using sp::shared_ptr;
 
 static const char* kProgName = "kudu_client";
+const char* kVerboseEnvVar = "KUDU_CLIENT_VERBOSE";
 
 // We need to reroute all logging to stderr when the client library is
 // loaded. GoogleOnceInit() can do that, but there are multiple entry
@@ -138,6 +141,21 @@ static const char* kProgName = "kudu_client";
 __attribute__((constructor))
 static void InitializeBasicLogging() {
   InitGoogleLoggingSafeBasic(kProgName);
+
+  SetVerboseLevelFromEnvVar();
+}
+
+// Set Client logging verbose level from environment variable.
+void SetVerboseLevelFromEnvVar() {
+  int32_t level = 0; // this is the default logging level;
+  const char* env_verbose_level = std::getenv(kVerboseEnvVar);
+  if (env_verbose_level != nullptr) {
+     if (safe_strto32(env_verbose_level, &level) && (level >= 0)) {
+       SetVerboseLogLevel(level);
+     } else {
+       LOG(WARNING) << "Invalid verbose level from environment variable " << kVerboseEnvVar;
+     }
+  }
 }
 
 // Adapts between the internal LogSeverity and the client's KuduLogSeverity.
@@ -443,6 +461,12 @@ Status KuduClient::OpenTable(const string& table_name,
   table->reset(new KuduTable(shared_from_this(),
                              table_name, table_id, num_replicas,
                              schema, partition_schema));
+
+  // When opening a table, clear the existing cached non-covered range entries.
+  // This avoids surprises where a new table instance won't be able to see the
+  // current range partitions of a table for up to the ttl.
+  data_->meta_cache_->ClearNonCoveredRangeEntries(table_id);
+
   return Status::OK();
 }
 
@@ -1236,6 +1260,21 @@ KuduSchema KuduScanner::GetProjectionSchema() const {
   return KuduSchema(*data_->configuration().projection());
 }
 
+Status KuduScanner::SetRowFormatFlags(uint64_t flags) {
+  switch (flags) {
+    case NO_FLAGS:
+    case PAD_UNIXTIME_MICROS_TO_16_BYTES:
+      break;
+    default:
+      return Status::InvalidArgument(Substitute("Invalid row format flags: $0", flags));
+  }
+  if (data_->open_) {
+    return Status::IllegalState("Row format flags must be set before Open()");
+  }
+
+  return data_->mutable_configuration()->SetRowFormatFlags(flags);
+}
+
 const ResourceMetrics& KuduScanner::GetResourceMetrics() const {
   return data_->resource_metrics_;
 }
@@ -1332,6 +1371,11 @@ bool KuduScanner::HasMoreRows() const {
 }
 
 Status KuduScanner::NextBatch(vector<KuduRowResult>* rows) {
+  if (PREDICT_FALSE(data_->configuration().row_format_flags() != KuduScanner::NO_FLAGS)) {
+    return Status::IllegalState(
+        Substitute("Cannot extract rows. Row format modifier flags were selected: $0",
+                   data_->configuration().row_format_flags()));
+  }
   RETURN_NOT_OK(NextBatch(&data_->batch_for_old_api_));
   data_->batch_for_old_api_.data_->ExtractRows(rows);
   return Status::OK();
@@ -1358,8 +1402,11 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
     return batch->data_->Reset(&data_->controller_,
                                data_->configuration().projection(),
                                data_->configuration().client_projection(),
-                                make_gscoped_ptr(data_->last_response_.release_data()));
-  } else if (data_->last_response_.has_more_results()) {
+                               data_->configuration().row_format_flags(),
+                               make_gscoped_ptr(data_->last_response_.release_data()));
+  }
+
+  if (data_->last_response_.has_more_results()) {
     // More data is available in this tablet.
     VLOG(2) << "Continuing " << data_->DebugString();
 
@@ -1379,6 +1426,7 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
         return batch->data_->Reset(&data_->controller_,
                                    data_->configuration().projection(),
                                    data_->configuration().client_projection(),
+                                   data_->configuration().row_format_flags(),
                                    make_gscoped_ptr(data_->last_response_.release_data()));
       }
 

@@ -42,6 +42,7 @@ class Slice;
 namespace fs {
 
 class BlockManager;
+struct FsReport;
 
 // The smallest unit of Kudu data that is backed by the local filesystem.
 //
@@ -112,6 +113,12 @@ class WritableBlock : public Block {
   // outstanding data to reach the disk.
   virtual Status Append(const Slice& data) = 0;
 
+  // Appends multiple chunks of data referenced by 'data' to the block.
+  //
+  // Does not guarantee durability of 'data'; Close() must be called for all
+  // outstanding data to reach the disk.
+  virtual Status AppendV(const std::vector<Slice>& data) = 0;
+
   // Begins an asynchronous flush of dirty block data to disk.
   //
   // This is purely a performance optimization for Close(); if there is
@@ -142,15 +149,17 @@ class ReadableBlock : public Block {
   // Returns the on-disk size of a written block.
   virtual Status Size(uint64_t* sz) const = 0;
 
-  // Reads exactly 'length' bytes beginning from 'offset' in the block,
-  // returning an error if fewer bytes exist. A slice referencing the
-  // results is written to 'result' and may be backed by memory in
-  // 'scratch'. As such, 'scratch' must be at least 'length' in size and
-  // must remain alive while 'result' is used.
-  //
-  // Does not modify 'result' on error (but may modify 'scratch').
-  virtual Status Read(uint64_t offset, size_t length,
-                      Slice* result, uint8_t* scratch) const = 0;
+  // Reads exactly 'result.size' bytes beginning from 'offset' in the block,
+  // returning an error if fewer bytes exist.
+  // Sets "result" to the data that was read.
+  // If an error was encountered, returns a non-OK status.
+  virtual Status Read(uint64_t offset, Slice* result) const = 0;
+
+  // Reads exactly the "results" aggregate bytes, based on each Slice's "size",
+  // beginning from 'offset' in the block, returning an error if fewer bytes exist.
+  // Sets each "result" to the data that was read.
+  // If an error was encountered, returns a non-OK status.
+  virtual Status ReadV(uint64_t offset, vector<Slice>* results) const = 0;
 
   // Returns the memory usage of this object including the object itself.
   virtual size_t memory_footprint() const = 0;
@@ -194,10 +203,18 @@ class BlockManager {
   // Returns an error if one already exists or cannot be created.
   virtual Status Create() = 0;
 
-  // Opens an existing on-disk representation of this block manager.
+  // Opens an existing on-disk representation of this block manager and
+  // checks it for inconsistencies. If found, and if the block manager was not
+  // constructed in read-only mode, an attempt will be made to repair them.
   //
-  // Returns an error if one does not exist or cannot be opened.
-  virtual Status Open() = 0;
+  // If 'report' is not nullptr, it will be populated with the results of the
+  // check (and repair, if applicable); otherwise, the results of the check
+  // will be logged and the presence of fatal inconsistencies will manifest as
+  // a returned error.
+  //
+  // Returns an error if an on-disk representation does not exist or cannot be
+  // opened.
+  virtual Status Open(FsReport* report) = 0;
 
   // Creates a new block using the provided options and opens it for
   // writing. The block's ID will be generated.

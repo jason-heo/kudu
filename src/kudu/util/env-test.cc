@@ -22,6 +22,7 @@
 #include <string>
 
 #include <glog/logging.h>
+#include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/bind.h"
@@ -48,12 +49,17 @@
 #define FALLOC_FL_PUNCH_HOLE  0x02 /* de-allocates range */
 #endif
 
+DECLARE_bool(never_fsync);
+DECLARE_int32(env_inject_short_read_bytes);
+DECLARE_int32(env_inject_short_write_bytes);
+
 namespace kudu {
 
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 static const uint64_t kOneMb = 1024 * 1024;
 static const uint64_t kTwoMb = 2 * kOneMb;
@@ -131,15 +137,15 @@ class TestEnv : public KuduTest {
 
   void ReadAndVerifyTestData(RandomAccessFile* raf, size_t offset, size_t n) {
     unique_ptr<uint8_t[]> scratch(new uint8_t[n]);
-    Slice s;
-    ASSERT_OK(env_util::ReadFully(raf, offset, n, &s,
-                                         scratch.get()));
+    Slice s(scratch.get(), n);
+    ASSERT_OK(raf->Read(offset, &s));
     ASSERT_EQ(n, s.size());
     ASSERT_NO_FATAL_FAILURE(VerifyTestData(s, offset));
   }
 
-  void TestAppendVector(size_t num_slices, size_t slice_size, size_t iterations,
-                        bool fast, bool pre_allocate, const WritableFileOptions& opts) {
+  void TestAppendV(size_t num_slices, size_t slice_size, size_t iterations,
+                   bool fast, bool pre_allocate,
+                   const WritableFileOptions &opts) {
     const string kTestPath = GetTestPath("test_env_appendvec_read_append");
     shared_ptr<WritableFile> file;
     ASSERT_OK(env_util::OpenFileForWrite(opts, env_, kTestPath, &file));
@@ -154,6 +160,9 @@ class TestEnv : public KuduTest {
 
     MakeVectors(num_slices, slice_size, iterations, &data, &input);
 
+    // Force short writes to half the slice length.
+    FLAGS_env_inject_short_write_bytes = slice_size / 2;
+
     shared_ptr<RandomAccessFile> raf;
 
     if (!fast) {
@@ -162,13 +171,13 @@ class TestEnv : public KuduTest {
 
     srand(123);
 
-    const string test_descr = strings::Substitute(
+    const string test_descr = Substitute(
         "appending a vector of slices(number of slices=$0,size of slice=$1 b) $2 times",
         num_slices, slice_size, iterations);
     LOG_TIMING(INFO, test_descr)  {
       for (int i = 0; i < iterations; i++) {
         if (fast || random() % 2) {
-          ASSERT_OK(file->AppendVector(input[i]));
+          ASSERT_OK(file->AppendV(input[i]));
         } else {
           for (const Slice& slice : input[i]) {
             ASSERT_OK(file->Append(slice));
@@ -176,7 +185,7 @@ class TestEnv : public KuduTest {
         }
         if (!fast) {
           // Verify as write. Note: this requires that file is pre-allocated, otherwise
-          // the ReadFully() fails with EINVAL.
+          // the Read() fails with EINVAL.
           ASSERT_NO_FATAL_FAILURE(ReadAndVerifyTestData(raf.get(), num_slices * slice_size * i,
                                                         num_slices * slice_size));
         }
@@ -363,48 +372,14 @@ TEST_F(TestEnv, TestTruncate) {
   // Read the whole file. Ensure it is all zeroes.
   unique_ptr<RandomAccessFile> raf;
   ASSERT_OK(env_->NewRandomAccessFile(test_path, &raf));
-  Slice s;
   unique_ptr<uint8_t[]> scratch(new uint8_t[size]);
-  ASSERT_OK(env_util::ReadFully(raf.get(), 0, size, &s, scratch.get()));
+  Slice s(scratch.get(), size);
+  ASSERT_OK(raf->Read(0, &s));
   const uint8_t* data = s.data();
   for (int i = 0; i < size; i++) {
     ASSERT_EQ(0, data[i]) << "Not null at position " << i;
   }
 }
-
-class ShortReadRandomAccessFile : public RandomAccessFile {
- public:
-  explicit ShortReadRandomAccessFile(shared_ptr<RandomAccessFile> wrapped)
-      : wrapped_(std::move(wrapped)) {}
-
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      uint8_t *scratch) const OVERRIDE {
-    CHECK_GT(n, 0);
-    // Divide the requested amount of data by a small integer,
-    // and issue the shorter read to the underlying file.
-    int short_n = n / ((rand() % 3) + 1);
-    if (short_n == 0) {
-      short_n = 1;
-    }
-
-    VLOG(1) << "Reading " << short_n << " instead of " << n;
-
-    return wrapped_->Read(offset, short_n, result, scratch);
-  }
-
-  virtual Status Size(uint64_t *size) const OVERRIDE {
-    return wrapped_->Size(size);
-  }
-
-  virtual const string& filename() const OVERRIDE { return wrapped_->filename(); }
-
-  virtual size_t memory_footprint() const OVERRIDE {
-    return wrapped_->memory_footprint();
-  }
-
- private:
-  const shared_ptr<RandomAccessFile> wrapped_;
-};
 
 // Write 'size' bytes of data to a file, with a simple pattern stored in it.
 static void WriteTestFile(Env* env, const string& path, size_t size) {
@@ -432,39 +407,110 @@ TEST_F(TestEnv, TestReadFully) {
   shared_ptr<RandomAccessFile> raf;
   ASSERT_OK(env_util::OpenFileForRandom(env, kTestPath, &raf));
 
-  ShortReadRandomAccessFile sr_raf(raf);
-
   const int kReadLength = 10000;
-  Slice s;
   unique_ptr<uint8_t[]> scratch(new uint8_t[kReadLength]);
+  Slice s(scratch.get(), kReadLength);
 
-  // Verify that ReadFully reads the whole requested data.
-  ASSERT_OK(env_util::ReadFully(&sr_raf, 0, kReadLength, &s, scratch.get()));
+  // Force a short read to half the data length
+  FLAGS_env_inject_short_read_bytes = kReadLength / 2;
+
+  // Verify that Read fully reads the whole requested data.
+  ASSERT_OK(raf->Read(0, &s));
   ASSERT_EQ(s.data(), scratch.get()) << "Should have returned a contiguous copy";
   ASSERT_EQ(kReadLength, s.size());
 
   // Verify that the data read was correct.
   VerifyTestData(s, 0);
 
-  // Verify that ReadFully fails with an IOError at EOF.
-  Status status = env_util::ReadFully(&sr_raf, kFileSize - 100, 200, &s, scratch.get());
+  // Turn short reads off again
+  FLAGS_env_inject_short_read_bytes = 0;
+
+  // Verify that Read fails with an IOError at EOF.
+  Slice s2(scratch.get(), 200);
+  Status status = raf->Read(kFileSize - 100, &s2);
   ASSERT_FALSE(status.ok());
   ASSERT_TRUE(status.IsIOError());
   ASSERT_STR_CONTAINS(status.ToString(), "EOF");
 }
 
-TEST_F(TestEnv, TestAppendVector) {
+TEST_F(TestEnv, TestReadVFully) {
+  // Create the file.
+  unique_ptr<RWFile> file;
+  ASSERT_OK(env_->NewRWFile(GetTestPath("foo"), &file));
+
+  // Append to it.
+  string kTestData = "abcde12345";
+  ASSERT_OK(file->Write(0, kTestData));
+
+  // Setup read parameters
+  size_t size1 = 5;
+  uint8_t scratch1[size1];
+  Slice result1(scratch1, size1);
+  size_t size2 = 5;
+  uint8_t scratch2[size2];
+  Slice result2(scratch2, size2);
+  vector<Slice> results = { result1, result2 };
+
+  // Force a short read
+  FLAGS_env_inject_short_read_bytes = 3;
+
+  // Verify that Read fully reads the whole requested data.
+  ASSERT_OK(file->ReadV(0, &results));
+  ASSERT_EQ(result1, "abcde");
+  ASSERT_EQ(result2, "12345");
+
+  // Turn short reads off again
+  FLAGS_env_inject_short_read_bytes = 0;
+
+  // Verify that Read fails with an IOError at EOF.
+  Status status = file->ReadV(5, &results);
+  ASSERT_FALSE(status.ok());
+  ASSERT_TRUE(status.IsIOError());
+  ASSERT_STR_CONTAINS(status.ToString(), "EOF");
+}
+
+TEST_F(TestEnv, TestIOVMax) {
+  Env* env = Env::Default();
+  const string kTestPath = GetTestPath("test");
+
+  const size_t slice_count = IOV_MAX + 42;
+  const size_t slice_size = 5;
+  const size_t data_size = slice_count * slice_size;
+
+  NO_FATALS(WriteTestFile(env, kTestPath, data_size));
+
+  // Reopen for read
+  shared_ptr<RandomAccessFile> file;
+  ASSERT_OK(env_util::OpenFileForRandom(env, kTestPath, &file));
+
+  // Setup more results slices than IOV_MAX
+  uint8_t scratch[data_size];
+  vector<Slice> results;
+  for (size_t i = 0; i < slice_count; i++) {
+    size_t shift = slice_size * i;
+    results.emplace_back(scratch + shift, slice_size);
+  }
+
+  // Force a short read too
+  FLAGS_env_inject_short_read_bytes = 3;
+
+  // Verify all the data is read
+  ASSERT_OK(file->ReadV(0, &results));
+  VerifyTestData(Slice(scratch, data_size), 0);
+}
+
+TEST_F(TestEnv, TestAppendV) {
   WritableFileOptions opts;
-  LOG(INFO) << "Testing AppendVector() only, NO pre-allocation";
-  ASSERT_NO_FATAL_FAILURE(TestAppendVector(2000, 1024, 5, true, false, opts));
+  LOG(INFO) << "Testing AppendV() only, NO pre-allocation";
+  ASSERT_NO_FATAL_FAILURE(TestAppendV(2000, 1024, 5, true, false, opts));
 
   if (!fallocate_supported_) {
     LOG(INFO) << "fallocate not supported, skipping preallocated runs";
   } else {
-    LOG(INFO) << "Testing AppendVector() only, WITH pre-allocation";
-    ASSERT_NO_FATAL_FAILURE(TestAppendVector(2000, 1024, 5, true, true, opts));
-    LOG(INFO) << "Testing AppendVector() together with Append() and Read(), WITH pre-allocation";
-    ASSERT_NO_FATAL_FAILURE(TestAppendVector(128, 4096, 5, false, true, opts));
+    LOG(INFO) << "Testing AppendV() only, WITH pre-allocation";
+    ASSERT_NO_FATAL_FAILURE(TestAppendV(2000, 1024, 5, true, true, opts));
+    LOG(INFO) << "Testing AppendV() together with Append() and Read(), WITH pre-allocation";
+    ASSERT_NO_FATAL_FAILURE(TestAppendV(128, 4096, 5, false, true, opts));
   }
 }
 
@@ -533,9 +579,9 @@ TEST_F(TestEnv, TestReopen) {
   uint64_t size;
   ASSERT_OK(reader->Size(&size));
   ASSERT_EQ(first.length() + second.length(), size);
-  Slice s;
   uint8_t scratch[size];
-  ASSERT_OK(env_util::ReadFully(reader.get(), 0, size, &s, scratch));
+  Slice s(scratch, size);
+  ASSERT_OK(reader->Read(0, &s));
   ASSERT_EQ(first + second, s.ToString());
 }
 
@@ -664,7 +710,7 @@ TEST_F(TestEnv, TestGlob) {
   }
 
   for (const auto& matcher : matchers) {
-    SCOPED_TRACE(strings::Substitute("pattern: $0, expected matches: $1",
+    SCOPED_TRACE(Substitute("pattern: $0, expected matches: $1",
                                      matcher.first, matcher.second));
     vector<string> matches;
     ASSERT_OK(env_->Glob(JoinPathSegments(dir, matcher.first), &matches));
@@ -706,6 +752,7 @@ TEST_F(TestEnv, TestGetFileModifiedTime) {
     ASSERT_OK(env_->GetFileModifiedTime(writer->filename(), &after_time));
     ASSERT_LT(initial_time, after_time);
   }, MonoDelta::FromSeconds(5));
+  NO_PENDING_FATALS();
 }
 
 TEST_F(TestEnv, TestRWFile) {
@@ -718,24 +765,37 @@ TEST_F(TestEnv, TestRWFile) {
   ASSERT_OK(file->Write(0, kTestData));
 
   // Read from it.
-  Slice result;
-  unique_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
-  ASSERT_OK(file->Read(0, kTestData.length(), &result, scratch.get()));
+  uint8_t scratch[kTestData.length()];
+  Slice result(scratch, kTestData.length());
+  ASSERT_OK(file->Read(0, &result));
   ASSERT_EQ(result, kTestData);
   uint64_t sz;
   ASSERT_OK(file->Size(&sz));
   ASSERT_EQ(kTestData.length(), sz);
+
+  // Read into multiple buffers
+  size_t size1 = 3;
+  uint8_t scratch1[size1];
+  Slice result1(scratch1, size1);
+  size_t size2 = 2;
+  uint8_t scratch2[size2];
+  Slice result2(scratch2, size2);
+  vector<Slice> results = { result1, result2 };
+  ASSERT_OK(file->ReadV(0, &results));
+  ASSERT_EQ(result1, "abc");
+  ASSERT_EQ(result2, "de");
 
   // Write past the end of the file and rewrite some of the interior.
   ASSERT_OK(file->Write(kTestData.length() * 2, kTestData));
   ASSERT_OK(file->Write(kTestData.length(), kTestData));
   ASSERT_OK(file->Write(1, kTestData));
   string kNewTestData = "aabcdebcdeabcde";
-  unique_ptr<uint8_t[]> scratch2(new uint8_t[kNewTestData.length()]);
-  ASSERT_OK(file->Read(0, kNewTestData.length(), &result, scratch2.get()));
+  uint8_t scratch3[kNewTestData.length()];
+  Slice result3(scratch3, kNewTestData.length());
+  ASSERT_OK(file->Read(0, &result3));
 
   // Retest.
-  ASSERT_EQ(result, kNewTestData);
+  ASSERT_EQ(result3, kNewTestData);
   ASSERT_OK(file->Size(&sz));
   ASSERT_EQ(kNewTestData.length(), sz);
 
@@ -747,8 +807,10 @@ TEST_F(TestEnv, TestRWFile) {
   // Reopen it without truncating the existing data.
   opts.mode = Env::OPEN_EXISTING;
   ASSERT_OK(env_->NewRWFile(opts, GetTestPath("foo"), &file));
-  ASSERT_OK(file->Read(0, kNewTestData.length(), &result, scratch2.get()));
-  ASSERT_EQ(result, kNewTestData);
+  uint8_t scratch4[kNewTestData.length()];
+  Slice result4(scratch4, kNewTestData.length());
+  ASSERT_OK(file->Read(0, &result4));
+  ASSERT_EQ(result3, kNewTestData);
 }
 
 TEST_F(TestEnv, TestCanonicalize) {
@@ -812,7 +874,7 @@ TEST_F(TestEnv, TestGetSpaceInfoFreeBytes) {
 
   // Loop in case there are concurrent tests running that are modifying the
   // filesystem.
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     if (env_->FileExists(kTestFilePath)) {
       ASSERT_OK(env_->DeleteFile(kTestFilePath)); // Clean up the previous iteration.
     }
@@ -855,6 +917,65 @@ TEST_F(TestEnv, TestChangeDir) {
   ASSERT_OK(env_->ChangeDir(orig_dir));
   ASSERT_OK(env_->GetCurrentWorkingDir(&cwd));
   ASSERT_EQ(orig_dir, cwd);
+}
+
+TEST_F(TestEnv, TestGetExtentMap) {
+  // In order to force filesystems that use delayed allocation to write out the
+  // extents, we must Sync() after the file is done growing, and that should
+  // trigger a real fsync() to the filesystem.
+  FLAGS_never_fsync = false;
+
+  const string kTestFilePath = GetTestPath("foo");
+  const int kFileSizeBytes = 1024*1024;
+
+  // Create a test file of a particular size.
+  unique_ptr<RWFile> f;
+  ASSERT_OK(env_->NewRWFile(kTestFilePath, &f));
+  ASSERT_OK(f->PreAllocate(0, kFileSizeBytes, RWFile::CHANGE_FILE_SIZE));
+  ASSERT_OK(f->Sync());
+
+  // The number and distribution of extents differs depending on the
+  // filesystem; this just provides coverage of the code path.
+  RWFile::ExtentMap extents;
+  Status s = f->GetExtentMap(&extents);
+  if (s.IsNotSupported()) {
+    LOG(INFO) << "GetExtentMap() not supported, skipping test";
+    return;
+  }
+  ASSERT_OK(s);
+  SCOPED_TRACE(extents);
+  int num_extents = extents.size();
+  ASSERT_GT(num_extents, 0) <<
+      "There should have been at least one extent in the file";
+
+  uint64_t fs_block_size;
+  ASSERT_OK(env_->GetBlockSize(kTestFilePath, &fs_block_size));
+
+  // Look for an extent to punch. We want an extent that's at least three times
+  // the block size so that we can punch out the "middle" fs block and thus
+  // split the extent in half.
+  uint64_t found_offset = 0;
+  for (const auto& e : extents) {
+    if (e.second >= (fs_block_size * 3)) {
+      found_offset = e.first + fs_block_size;
+      break;
+    }
+  }
+  ASSERT_GT(found_offset, 0) << "Couldn't find extent to split";
+
+  // Punch out a hole and split the extent.
+  s = f->PunchHole(found_offset, fs_block_size);
+  if (s.IsNotSupported()) {
+    LOG(INFO) << "PunchHole() not supported, skipping this part of the test";
+    return;
+  }
+  ASSERT_OK(s);
+  ASSERT_OK(f->Sync());
+
+  // Test the extent map; there should be one more extent.
+  ASSERT_OK(f->GetExtentMap(&extents));
+  ASSERT_EQ(num_extents + 1, extents.size()) <<
+      "Punching a hole should have increased the number of extents by one";
 }
 
 }  // namespace kudu

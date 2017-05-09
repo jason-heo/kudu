@@ -73,6 +73,8 @@ using master::IsAlterTableDoneRequestPB;
 using master::IsAlterTableDoneResponsePB;
 using master::IsCreateTableDoneRequestPB;
 using master::IsCreateTableDoneResponsePB;
+using master::ListMastersRequestPB;
+using master::ListMastersResponsePB;
 using master::ListTablesRequestPB;
 using master::ListTablesResponsePB;
 using master::ListTabletServersRequestPB;
@@ -184,7 +186,10 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
       const ErrorStatusPB* err = rpc.error_response();
       if (err &&
           err->has_code() &&
-          err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY) {
+          (err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY ||
+           err->code() == ErrorStatusPB::ERROR_UNAVAILABLE)) {
+        // The UNAVAILABLE error code is a broader counterpart of the
+        // SERVER_TOO_BUSY. In both cases it's necessary to retry a bit later.
         continue;
       }
     }
@@ -290,6 +295,18 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     const boost::function<Status(MasterServiceProxy*,
                                  const ListTabletServersRequestPB&,
                                  ListTabletServersResponsePB*,
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags);
+template
+Status KuduClient::Data::SyncLeaderMasterRpc(
+    const MonoTime& deadline,
+    KuduClient* client,
+    const ListMastersRequestPB& req,
+    ListMastersResponsePB* resp,
+    const char* func_name,
+    const boost::function<Status(MasterServiceProxy*,
+                                 const ListMastersRequestPB&,
+                                 ListMastersResponsePB*,
                                  RpcController*)>& func,
     vector<uint32_t> required_feature_flags);
 

@@ -43,6 +43,7 @@ class HostPort;
 class MetricPrototype;
 class MetricEntityPrototype;
 class NodeInstancePB;
+class ScopedSubprocess;
 class Sockaddr;
 class Subprocess;
 
@@ -136,6 +137,10 @@ struct ExternalMiniClusterOptions {
   // If true, sends logging output to stderr instead of a log file. Defaults to
   // true.
   bool logtostderr;
+
+  // Amount of time that may elapse between the creation of a daemon process
+  // and the process writing out its info file. Defaults to 30 seconds.
+  MonoDelta start_process_timeout;
 };
 
 // A mini-cluster made up of subprocesses running each of the daemons
@@ -146,7 +151,13 @@ struct ExternalMiniClusterOptions {
 // of the daemons.
 class ExternalMiniCluster : public MiniClusterBase {
  public:
-  explicit ExternalMiniCluster(const ExternalMiniClusterOptions& opts);
+  // Constructs a cluster with the default options.
+  ExternalMiniCluster();
+
+  // Constructs a cluster with options specified in 'opts'.
+  explicit ExternalMiniCluster(ExternalMiniClusterOptions opts);
+
+  // Destroys a cluster.
   virtual ~ExternalMiniCluster();
 
   // Start the cluster.
@@ -320,7 +331,9 @@ struct ExternalDaemonOptions {
   std::string exe;
   std::string data_dir;
   std::string log_dir;
+  std::string perf_record_filename;
   std::vector<std::string> extra_flags;
+  MonoDelta start_process_timeout;
 };
 
 class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
@@ -450,6 +463,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   const std::shared_ptr<rpc::Messenger> messenger_;
   const std::string data_dir_;
   const std::string log_dir_;
+  const std::string perf_record_filename_;
+  const MonoDelta start_process_timeout_;
   const bool logtostderr_;
   std::string exe_;
   std::vector<std::string> extra_flags_;
@@ -457,6 +472,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
 
   gscoped_ptr<Subprocess> process_;
   bool paused_ = false;
+
+  std::unique_ptr<Subprocess> perf_record_process_;
 
   gscoped_ptr<server::ServerStatusPB> status_;
   std::string rpc_bind_address_;

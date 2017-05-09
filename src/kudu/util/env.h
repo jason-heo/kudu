@@ -15,6 +15,7 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -345,15 +346,13 @@ class SequentialFile {
   SequentialFile() { }
   virtual ~SequentialFile();
 
-  // Read up to "n" bytes from the file.  "scratch[0..n-1]" may be
-  // written by this routine.  Sets "*result" to the data that was
-  // read (including if fewer than "n" bytes were successfully read).
-  // May set "*result" to point at data in "scratch[0..n-1]", so
-  // "scratch[0..n-1]" must be live when "*result" is used.
-  // If an error was encountered, returns a non-OK status.
+  // Read up to "result.size" bytes from the file.
+  // Sets "result.data" to the data that was read.
+  // If an error was encountered, returns a non-OK status
+  // and the contents of "result" are invalid.
   //
   // REQUIRES: External synchronization
-  virtual Status Read(size_t n, Slice* result, uint8_t *scratch) = 0;
+  virtual Status Read(Slice* result) = 0;
 
   // Skip "n" bytes from the file. This is guaranteed to be no
   // slower that reading the same data, but may be faster.
@@ -374,17 +373,28 @@ class RandomAccessFile {
   RandomAccessFile() { }
   virtual ~RandomAccessFile();
 
-  // Read up to "n" bytes from the file starting at "offset".
-  // "scratch[0..n-1]" may be written by this routine.  Sets "*result"
-  // to the data that was read (including if fewer than "n" bytes were
-  // successfully read).  May set "*result" to point at data in
-  // "scratch[0..n-1]", so "scratch[0..n-1]" must be live when
-  // "*result" is used.  If an error was encountered, returns a non-OK
-  // status.
+  // Read up to "result.size" from the file starting at "offset".
+  // Sets "result.data" to the data that was read.
+  // If an error was encountered, returns a non-OK status.
+  //
+  // This method will internally retry on EINTR and "short reads" in order to
+  // fully read the requested number of bytes. In the event that it is not
+  // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      uint8_t *scratch) const = 0;
+  virtual Status Read(uint64_t offset, Slice* result) const = 0;
+
+  // Reads up to the "results" aggregate size, based on each Slice's "size",
+  // from the file starting at 'offset'.
+  // Sets each "result.data" to the data that was read.
+  // If an error was encountered, returns a non-OK status.
+  //
+  // This method will internally retry on EINTR and "short reads" in order to
+  // fully read the requested number of bytes. In the event that it is not
+  // possible to read exactly 'length' bytes, an IOError is returned.
+  //
+  // Safe for concurrent use by multiple threads.
+  virtual Status ReadV(uint64_t offset, std::vector<Slice>* results) const = 0;
 
   // Returns the size of the file
   virtual Status Size(uint64_t *size) const = 0;
@@ -435,7 +445,7 @@ class WritableFile {
   //
   // For implementation specific quirks and details, see comments in
   // implementation source code (e.g., env_posix.cc)
-  virtual Status AppendVector(const std::vector<Slice>& data_vector) = 0;
+  virtual Status AppendV(const std::vector<Slice>& data) = 0;
 
   // Pre-allocates 'size' bytes for the file in the underlying filesystem.
   // size bytes are added to the current pre-allocated size or to the current
@@ -503,10 +513,8 @@ class RWFile {
 
   virtual ~RWFile();
 
-  // Read exactly 'length' bytes from the file starting at 'offset'.
-  // 'scratch[0..length-1]' may be written by this routine. Sets '*result'
-  // to the data that was read. May set '*result' to point at data in
-  // 'scratch[0..length-1]', which must be live when '*result' is used.
+  // Read up to "result.size" from the file starting at "offset".
+  // Sets "result.data" to the data that was read.
   // If an error was encountered, returns a non-OK status.
   //
   // This method will internally retry on EINTR and "short reads" in order to
@@ -514,11 +522,25 @@ class RWFile {
   // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
-  virtual Status Read(uint64_t offset, size_t length,
-                      Slice* result, uint8_t* scratch) const = 0;
+  virtual Status Read(uint64_t offset, Slice* result) const = 0;
+
+  // Reads up to the "results" aggregate size, based on each Slice's "size",
+  // from the file starting at 'offset'.
+  // Sets each "result.data" to the data that was read.
+  // If an error was encountered, returns a non-OK status.
+  //
+  // This method will internally retry on EINTR and "short reads" in order to
+  // fully read the requested number of bytes. In the event that it is not
+  // possible to read exactly 'length' bytes, an IOError is returned.
+  //
+  // Safe for concurrent use by multiple threads.
+  virtual Status ReadV(uint64_t offset, std::vector<Slice>* results) const = 0;
 
   // Writes 'data' to the file position given by 'offset'.
   virtual Status Write(uint64_t offset, const Slice& data) = 0;
+
+  // Writes the 'data' vector to the file position given by 'offset'.
+  virtual Status WriteV(uint64_t offset, const std::vector<Slice>& data) = 0;
 
   // Preallocates 'length' bytes for the file in the underlying filesystem
   // beginning at 'offset'. It is safe to preallocate the same range
@@ -576,6 +598,19 @@ class RWFile {
 
   // Retrieves the file's size.
   virtual Status Size(uint64_t* size) const = 0;
+
+  // Retrieve a map of the file's live extents.
+  //
+  // Each map entry is an offset and size representing a section of live file
+  // data. Any byte offset not contained in a map entry implicitly belongs to a
+  // "hole" in the (sparse) file.
+  //
+  // If the underlying filesystem does not support extents, map entries
+  // represent runs of adjacent fixed-size filesystem blocks instead. If the
+  // platform doesn't support fetching extents at all, a NotSupported status
+  // will be returned.
+  typedef std::map<uint64_t, uint64_t> ExtentMap;
+  virtual Status GetExtentMap(ExtentMap* out) const = 0;
 
   // Returns the filename provided when the RWFile was constructed.
   virtual const std::string& filename() const = 0;

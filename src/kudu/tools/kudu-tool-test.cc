@@ -44,6 +44,7 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/fs/fs_report.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/split.h"
@@ -56,7 +57,7 @@
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet_metadata.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tools/tool_test_util.h"
@@ -87,6 +88,7 @@ using client::sp::shared_ptr;
 using consensus::OpId;
 using consensus::ReplicateRefPtr;
 using consensus::ReplicateMsg;
+using fs::FsReport;
 using fs::WritableBlock;
 using itest::ExternalMiniClusterFsInspector;
 using itest::TServerDetails;
@@ -105,7 +107,7 @@ using tablet::Tablet;
 using tablet::TabletDataState;
 using tablet::TabletHarness;
 using tablet::TabletMetadata;
-using tablet::TabletPeer;
+using tablet::TabletReplica;
 using tablet::TabletSuperBlockPB;
 using tserver::DeleteTabletRequestPB;
 using tserver::DeleteTabletResponsePB;
@@ -219,23 +221,34 @@ class ToolTest : public KuduTest {
   }
 
   void RunFsCheck(const string& arg_str,
-                  int expected_num_blocks,
-                  int expected_num_missing,
+                  int expected_num_live,
+                  const string& tablet_id,
+                  const vector<BlockId>& expected_missing_blocks,
                   int expected_num_orphaned) {
     string stdout;
     string stderr;
     Status s = RunTool(arg_str, &stdout, &stderr, nullptr, nullptr);
     SCOPED_TRACE(stdout);
     SCOPED_TRACE(stderr);
-    if (expected_num_missing) {
+    if (!expected_missing_blocks.empty()) {
       ASSERT_TRUE(s.IsRuntimeError());
       ASSERT_STR_CONTAINS(stderr, "Corruption");
     } else {
       ASSERT_TRUE(s.ok());
     }
-    ASSERT_STR_CONTAINS(stdout, Substitute("$0 blocks", expected_num_blocks));
-    ASSERT_STR_CONTAINS(stdout, Substitute("$0 missing", expected_num_missing));
-    ASSERT_STR_CONTAINS(stdout, Substitute("$0 orphaned", expected_num_orphaned));
+    ASSERT_STR_CONTAINS(
+        stdout, Substitute("Total live blocks: $0", expected_num_live));
+    ASSERT_STR_CONTAINS(
+        stdout, Substitute("Total missing blocks: $0", expected_missing_blocks.size()));
+    if (!expected_missing_blocks.empty()) {
+      ASSERT_STR_CONTAINS(
+          stdout, Substitute("Fatal error: tablet $0 missing blocks: ", tablet_id));
+      for (const auto& b : expected_missing_blocks) {
+        ASSERT_STR_CONTAINS(stdout, b.ToString());
+      }
+    }
+    ASSERT_STR_CONTAINS(
+        stdout, Substitute("Total orphaned blocks: $0", expected_num_orphaned));
   }
 
  protected:
@@ -264,7 +277,7 @@ void ToolTest::StartExternalMiniCluster(const vector<string>& extra_master_flags
   cluster_.reset(new ExternalMiniCluster(cluster_opts_));
   ASSERT_OK(cluster_->Start());
   inspect_.reset(new ExternalMiniClusterFsInspector(cluster_.get()));
-  ASSERT_OK(CreateTabletServerMap(cluster_->master_proxy().get(),
+  ASSERT_OK(CreateTabletServerMap(cluster_->master_proxy(),
                                   cluster_->messenger(), &ts_map_));
 }
 
@@ -453,7 +466,8 @@ TEST_F(ToolTest, TestModeHelp) {
     const vector<string> kTServerModeRegexes = {
         "set_flag.*Change a gflag value",
         "status.*Get the status",
-        "timestamp.*Get the current timestamp"
+        "timestamp.*Get the current timestamp",
+        "list.*List tablet servers"
     };
     NO_FATALS(RunTestHelp("tserver", kTServerModeRegexes));
   }
@@ -510,19 +524,22 @@ TEST_F(ToolTest, TestFsCheck) {
   // Check the filesystem; all the blocks should be accounted for, and there
   // should be no blocks missing or orphaned.
   NO_FATALS(RunFsCheck(Substitute("fs check --fs_wal_dir=$0", kTestDir),
-                       block_ids.size(), 0, 0));
+                       block_ids.size(), kTabletId, {}, 0));
 
   // Delete half of the blocks. Upon the next check we can only find half, and
   // the other half are deemed missing.
+  vector<BlockId> missing_ids;
   {
     FsManager fs(env_, kTestDir);
-    ASSERT_OK(fs.Open());
+    FsReport report;
+    ASSERT_OK(fs.Open(&report));
     for (int i = 0; i < block_ids.size(); i += 2) {
       ASSERT_OK(fs.DeleteBlock(block_ids[i]));
+      missing_ids.push_back(block_ids[i]);
     }
   }
   NO_FATALS(RunFsCheck(Substitute("fs check --fs_wal_dir=$0", kTestDir),
-                       block_ids.size() / 2, block_ids.size() / 2, 0));
+                       block_ids.size() / 2, kTabletId, missing_ids, 0));
 
   // Delete the tablet superblock. The next check finds half of the blocks,
   // though without the superblock they're all considered to be orphaned.
@@ -531,27 +548,28 @@ TEST_F(ToolTest, TestFsCheck) {
   // be no effect.
   {
     FsManager fs(env_, kTestDir);
-    ASSERT_OK(fs.Open());
+    FsReport report;
+    ASSERT_OK(fs.Open(&report));
     ASSERT_OK(env_->DeleteFile(fs.GetTabletMetadataPath(kTabletId)));
   }
   for (int i = 0; i < 2; i++) {
     NO_FATALS(RunFsCheck(Substitute("fs check --fs_wal_dir=$0", kTestDir),
-                         block_ids.size() / 2, 0, block_ids.size() / 2));
+                         block_ids.size() / 2, kTabletId, {}, block_ids.size() / 2));
   }
 
   // Repair the filesystem. The remaining half of all blocks were found, deemed
   // to be orphaned, and deleted. The next check shows no remaining blocks.
   NO_FATALS(RunFsCheck(Substitute("fs check --fs_wal_dir=$0 --repair", kTestDir),
-                       block_ids.size() / 2, 0, block_ids.size() / 2));
+                       block_ids.size() / 2, kTabletId, {}, block_ids.size() / 2));
   NO_FATALS(RunFsCheck(Substitute("fs check --fs_wal_dir=$0", kTestDir),
-                       0, 0, 0));
+                       0, kTabletId, {}, 0));
 }
 
 TEST_F(ToolTest, TestFsCheckLiveServer) {
   NO_FATALS(StartExternalMiniCluster());
   string master_data_dir = cluster_->GetDataPath("master-0");
   string args = Substitute("fs check --fs_wal_dir $0", master_data_dir);
-  NO_FATALS(RunFsCheck(args, 0, 0, 0));
+  NO_FATALS(RunFsCheck(args, 0, "", {}, 0));
   args += " --repair";
   string stdout;
   string stderr;
@@ -1232,12 +1250,12 @@ TEST_F(ToolTest, TestLocalReplicaDelete) {
   // is reduced at all.
   string tablet_id;
   {
-    vector<scoped_refptr<TabletPeer>> tablet_peers;
-    ts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-    ASSERT_EQ(1, tablet_peers.size());
-    Tablet* tablet = tablet_peers[0]->tablet();
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(1, tablet_replicas.size());
+    Tablet* tablet = tablet_replicas[0]->tablet();
     ASSERT_OK(tablet->Flush());
-    tablet_id = tablet_peers[0]->tablet_id();
+    tablet_id = tablet_replicas[0]->tablet_id();
   }
   const string& tserver_dir = ts->options()->fs_opts.wal_path;
   // Using the delete tool with tablet server running fails.
@@ -1279,9 +1297,9 @@ TEST_F(ToolTest, TestLocalReplicaDelete) {
   // we can expect the tablet server to have nothing after it comes up.
   ASSERT_OK(ts->Start());
   ASSERT_OK(ts->WaitStarted());
-  vector<scoped_refptr<TabletPeer>> tablet_peers;
-  ts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-  ASSERT_EQ(0, tablet_peers.size());
+  vector<scoped_refptr<TabletReplica>> tablet_replicas;
+  ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+  ASSERT_EQ(0, tablet_replicas.size());
 }
 
 // Test 'kudu local_replica delete' tool for tombstoning the tablet.
@@ -1312,12 +1330,12 @@ TEST_F(ToolTest, TestLocalReplicaTombstoneDelete) {
   last_logged_opid.Clear();
   string tablet_id;
   {
-    vector<scoped_refptr<TabletPeer>> tablet_peers;
-    ts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-    ASSERT_EQ(1, tablet_peers.size());
-    tablet_id = tablet_peers[0]->tablet_id();
-    tablet_peers[0]->log()->GetLatestEntryOpId(&last_logged_opid);
-    Tablet* tablet = tablet_peers[0]->tablet();
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(1, tablet_replicas.size());
+    tablet_id = tablet_replicas[0]->tablet_id();
+    tablet_replicas[0]->log()->GetLatestEntryOpId(&last_logged_opid);
+    Tablet* tablet = tablet_replicas[0]->tablet();
     ASSERT_OK(tablet->Flush());
   }
   const string& tserver_dir = ts->options()->fs_opts.wal_path;
@@ -1344,17 +1362,88 @@ TEST_F(ToolTest, TestLocalReplicaTombstoneDelete) {
   ASSERT_OK(ts->Start());
   ASSERT_OK(ts->WaitStarted());
   {
-    vector<scoped_refptr<TabletPeer>> tablet_peers;
-    ts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-    ASSERT_EQ(1, tablet_peers.size());
-    ASSERT_EQ(tablet_id, tablet_peers[0]->tablet_id());
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    ts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(1, tablet_replicas.size());
+    ASSERT_EQ(tablet_id, tablet_replicas[0]->tablet_id());
     ASSERT_EQ(TabletDataState::TABLET_DATA_TOMBSTONED,
-              tablet_peers[0]->tablet_metadata()->tablet_data_state());
-    OpId tombstoned_opid = tablet_peers[0]->tablet_metadata()->tombstone_last_logged_opid();
+              tablet_replicas[0]->tablet_metadata()->tablet_data_state());
+    OpId tombstoned_opid = tablet_replicas[0]->tablet_metadata()->tombstone_last_logged_opid();
     ASSERT_TRUE(tombstoned_opid.IsInitialized());
     ASSERT_EQ(last_logged_opid.term(), tombstoned_opid.term());
     ASSERT_EQ(last_logged_opid.index(), tombstoned_opid.index());
   }
+}
+
+TEST_F(ToolTest, TestTserverList) {
+  NO_FATALS(StartExternalMiniCluster({}, {}, 1));
+
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  const auto& tserver = cluster_->tablet_server(0);
+
+  { // TSV
+    string out;
+    NO_FATALS(RunActionStdoutString(Substitute("tserver list $0 --columns=uuid --format=tsv",
+                                              master_addr),
+                                    &out));
+
+    ASSERT_EQ(tserver->uuid(), out);
+  }
+
+  { // JSON
+    string out;
+    NO_FATALS(RunActionStdoutString(
+          Substitute("tserver list $0 --columns=uuid,rpc-addresses --format=json", master_addr),
+          &out));
+
+    ASSERT_EQ(Substitute("[{\"uuid\":\"$0\",\"rpc-addresses\":\"$1\"}]",
+                         tserver->uuid(), tserver->bound_rpc_hostport().ToString()),
+              out);
+  }
+
+  { // Pretty
+    string out;
+    NO_FATALS(RunActionStdoutString(
+          Substitute("tserver list $0 --columns=uuid,rpc-addresses", master_addr),
+          &out));
+
+    ASSERT_STR_CONTAINS(out, tserver->uuid());
+    ASSERT_STR_CONTAINS(out, tserver->bound_rpc_hostport().ToString());
+  }
+
+  { // Add a tserver
+    ASSERT_OK(cluster_->AddTabletServer());
+
+    vector<string> lines;
+    NO_FATALS(RunActionStdoutLines(
+          Substitute("tserver list $0 --columns=uuid --format=space", master_addr),
+          &lines));
+
+    vector<string> expected = {
+      tserver->uuid(),
+      cluster_->tablet_server(1)->uuid(),
+    };
+
+    std::sort(lines.begin(), lines.end());
+    std::sort(expected.begin(), expected.end());
+
+    ASSERT_EQ(expected, lines);
+  }
+}
+
+TEST_F(ToolTest, TestMasterList) {
+  NO_FATALS(StartExternalMiniCluster({}, {}, 0));
+
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  auto* master = cluster_->master();
+
+  string out;
+  NO_FATALS(RunActionStdoutString(
+        Substitute("master list $0 --columns=uuid,rpc-addresses", master_addr),
+        &out));
+
+  ASSERT_STR_CONTAINS(out, master->uuid());
+  ASSERT_STR_CONTAINS(out, master->bound_rpc_hostport().ToString());
 }
 
 } // namespace tools

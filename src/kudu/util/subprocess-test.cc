@@ -36,11 +36,7 @@ namespace kudu {
 class SubprocessTest : public KuduTest {};
 
 TEST_F(SubprocessTest, TestSimplePipe) {
-  vector<string> argv;
-  argv.push_back("tr");
-  argv.push_back("a-z");
-  argv.push_back("A-Z");
-  Subprocess p("/usr/bin/tr", argv);
+  Subprocess p({ "/usr/bin/tr", "a-z", "A-Z" });
   p.ShareParentStdout(false);
   ASSERT_OK(p.Start());
 
@@ -65,10 +61,7 @@ TEST_F(SubprocessTest, TestSimplePipe) {
 }
 
 TEST_F(SubprocessTest, TestErrPipe) {
-  vector<string> argv;
-  argv.push_back("tee");
-  argv.push_back("/dev/stderr");
-  Subprocess p("/usr/bin/tee", argv);
+  Subprocess p({ "/usr/bin/tee", "/dev/stderr" });
   p.ShareParentStderr(false);
   ASSERT_OK(p.Start());
 
@@ -92,9 +85,7 @@ TEST_F(SubprocessTest, TestErrPipe) {
 }
 
 TEST_F(SubprocessTest, TestKill) {
-  vector<string> argv;
-  argv.push_back("cat");
-  Subprocess p("/bin/cat", argv);
+  Subprocess p({ "/bin/cat" });
   ASSERT_OK(p.Start());
 
   ASSERT_OK(p.Kill(SIGKILL));
@@ -133,7 +124,7 @@ TEST_F(SubprocessTest, TestReadFromStdoutAndStderr) {
 
 // Test that environment variables can be passed to the subprocess.
 TEST_F(SubprocessTest, TestEnvVars) {
-  Subprocess p("bash", {"/bin/bash", "-c", "echo $FOO"});
+  Subprocess p({ "/bin/bash", "-c", "echo $FOO" });
   p.SetEnvVars({{"FOO", "bar"}});
   p.ShareParentStdout(false);
   ASSERT_OK(p.Start());
@@ -174,7 +165,7 @@ TEST_F(SubprocessTest, TestReadSingleFD) {
 }
 
 TEST_F(SubprocessTest, TestGetExitStatusExitSuccess) {
-  Subprocess p("/bin/sh", { "/bin/sh", "-c", "exit 0" });
+  Subprocess p({ "/bin/sh", "-c", "exit 0" });
   ASSERT_OK(p.Start());
   ASSERT_OK(p.Wait());
   int exit_status;
@@ -187,8 +178,7 @@ TEST_F(SubprocessTest, TestGetExitStatusExitSuccess) {
 TEST_F(SubprocessTest, TestGetExitStatusExitFailure) {
   static const vector<int> kStatusCodes = { 1, 255 };
   for (auto code : kStatusCodes) {
-    vector<string> argv = { "/bin/sh", "-c", Substitute("exit $0", code)};
-    Subprocess p("/bin/sh", argv);
+    Subprocess p({ "/bin/sh", "-c", Substitute("exit $0", code) });
     ASSERT_OK(p.Start());
     ASSERT_OK(p.Wait());
     int exit_status;
@@ -210,7 +200,7 @@ TEST_F(SubprocessTest, TestGetExitStatusSignaled) {
     SIGUSR2,
   };
   for (auto signum : kSignals) {
-    Subprocess p("/bin/cat", { "cat" });
+    Subprocess p({ "/bin/cat" });
     ASSERT_OK(p.Start());
     ASSERT_OK(p.Kill(signum));
     ASSERT_OK(p.Wait());
@@ -221,6 +211,54 @@ TEST_F(SubprocessTest, TestGetExitStatusSignaled) {
     ASSERT_STR_CONTAINS(exit_info, Substitute("process exited on signal $0",
                                               signum));
   }
+}
+
+TEST_F(SubprocessTest, TestSubprocessDestroyWithCustomSignal) {
+  string kTestFile = GetTestPath("foo");
+
+  // Start a subprocess that creates kTestFile immediately and deletes it on exit.
+  //
+  // Note: it's important that the shell not invoke a command while waiting
+  // to be killed (i.e. "sleep 60"); if it did, the signal could be delivered
+  // just after the command starts but just before the shell decides to forward
+  // signals to it, and we wind up with a deadlock.
+  vector<string> argv = {
+      "/bin/bash",
+      "-c",
+      Substitute(
+          // Delete kTestFile on exit.
+          "trap \"rm $0\" EXIT;"
+          // Create kTestFile on start.
+          "touch $0;"
+          // Spin in a tight loop waiting to be killed.
+          "while true;"
+          "  do FOO=$$((FOO + 1));"
+          "done", kTestFile)
+  };
+
+  {
+    Subprocess s(argv);
+    ASSERT_OK(s.Start());
+    AssertEventually([&]{
+        ASSERT_TRUE(env_->FileExists(kTestFile));
+    });
+  }
+
+  // The subprocess went out of scope and was killed with SIGKILL, so it left
+  // kTestFile behind.
+  ASSERT_TRUE(env_->FileExists(kTestFile));
+
+  ASSERT_OK(env_->DeleteFile(kTestFile));
+  {
+    Subprocess s(argv, SIGTERM);
+    ASSERT_OK(s.Start());
+    AssertEventually([&]{
+        ASSERT_TRUE(env_->FileExists(kTestFile));
+    });
+  }
+
+  // The subprocess was killed with SIGTERM, giving it a chance to delete kTestFile.
+  ASSERT_FALSE(env_->FileExists(kTestFile));
 }
 
 } // namespace kudu

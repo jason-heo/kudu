@@ -28,7 +28,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/util/auto_release_pool.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
@@ -71,8 +71,9 @@ class ScannerManager {
   Status StartRemovalThread();
 
   // Create a new scanner with a unique ID, inserting it into the map.
-  void NewScanner(const scoped_refptr<tablet::TabletPeer>& tablet_peer,
+  void NewScanner(const scoped_refptr<tablet::TabletReplica>& tablet_replica,
                   const std::string& requestor_string,
+                  uint64_t row_format_flags,
                   SharedScanner* scanner);
 
   // Lookup the given scanner by its ID.
@@ -168,8 +169,9 @@ class ScopedUnregisterScanner {
 class Scanner {
  public:
   Scanner(std::string id,
-          const scoped_refptr<tablet::TabletPeer>& tablet_peer,
-          std::string requestor_string, ScannerMetrics* metrics);
+          const scoped_refptr<tablet::TabletReplica>& tablet_replica,
+          std::string requestor_string, ScannerMetrics* metrics,
+          uint64_t row_format_flags);
   ~Scanner();
 
   // Attach an actual iterator and a ScanSpec to this Scanner.
@@ -215,11 +217,11 @@ class Scanner {
   const ScanSpec& spec() const;
 
   const std::string& tablet_id() const {
-    // scanners-test passes a null tablet_peer.
-    return tablet_peer_ ? tablet_peer_->tablet_id() : kNullTabletId;
+    // scanners-test passes a null tablet_replica.
+    return tablet_replica_ ? tablet_replica_->tablet_id() : kNullTabletId;
   }
 
-  const scoped_refptr<tablet::TabletPeer>& tablet_peer() const { return tablet_peer_; }
+  const scoped_refptr<tablet::TabletReplica>& tablet_replica() const { return tablet_replica_; }
 
   const std::string& requestor_string() const { return requestor_string_; }
 
@@ -272,6 +274,10 @@ class Scanner {
     already_reported_stats_ = stats;
   }
 
+  uint64_t row_format_flags() const {
+    return row_format_flags_;
+  }
+
  private:
   friend class ScannerManager;
 
@@ -281,7 +287,7 @@ class Scanner {
   const std::string id_;
 
   // Tablet associated with the scanner.
-  const scoped_refptr<tablet::TabletPeer> tablet_peer_;
+  const scoped_refptr<tablet::TabletReplica> tablet_replica_;
 
   // Information about the requestor. Populated from
   // RpcContext::requestor_string().
@@ -322,6 +328,9 @@ class Scanner {
   // itself. This is _not_ used for row data, which is scoped to a single RPC
   // response.
   Arena arena_;
+
+  // The row format flags the client passed, if any.
+  const uint64_t row_format_flags_;
 
   DISALLOW_COPY_AND_ASSIGN(Scanner);
 };

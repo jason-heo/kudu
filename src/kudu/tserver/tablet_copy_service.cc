@@ -30,12 +30,13 @@
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/server/server_base.h"
 #include "kudu/tserver/tablet_copy_source_session.h"
-#include "kudu/tserver/tablet_peer_lookup.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tserver/tablet_replica_lookup.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/random_util.h"
 
 #define RPC_RETURN_NOT_OK(expr, app_err, message, context) \
   do { \
@@ -62,23 +63,33 @@ DEFINE_double(fault_crash_on_handle_tc_fetch_data, 0.0,
               "(For testing only!)");
 TAG_FLAG(fault_crash_on_handle_tc_fetch_data, unsafe);
 
+DEFINE_double(tablet_copy_early_session_timeout_prob, 0,
+              "The probability that a tablet copy session will time out early, "
+              "resulting in tablet copy failure. (For testing only!)");
+TAG_FLAG(tablet_copy_early_session_timeout_prob, unsafe);
+
 using strings::Substitute;
 
 namespace kudu {
 
 using crc::Crc32c;
 using server::ServerBase;
-using tablet::TabletPeer;
+using tablet::TabletReplica;
 
 namespace tserver {
 
+static MonoTime GetNewExpireTime() {
+  return MonoTime::Now() + MonoDelta::FromMilliseconds(FLAGS_tablet_copy_idle_timeout_ms);
+}
+
 TabletCopyServiceImpl::TabletCopyServiceImpl(
     ServerBase* server,
-    TabletPeerLookupIf* tablet_peer_lookup)
+    TabletReplicaLookupIf* tablet_replica_lookup)
     : TabletCopyServiceIf(server->metric_entity(), server->result_tracker()),
       server_(server),
       fs_manager_(CHECK_NOTNULL(server->fs_manager())),
-      tablet_peer_lookup_(CHECK_NOTNULL(tablet_peer_lookup)),
+      tablet_replica_lookup_(CHECK_NOTNULL(tablet_replica_lookup)),
+      rand_(GetRandomSeed32()),
       shutdown_latch_(1) {
   CHECK_OK(Thread::Create("tablet-copy", "tc-session-exp",
                           &TabletCopyServiceImpl::EndExpiredSessions, this,
@@ -106,8 +117,8 @@ void TabletCopyServiceImpl::BeginTabletCopySession(
   // but there is no guarantee this will not change in the future.
   const string session_id = Substitute("$0-$1", requestor_uuid, tablet_id);
 
-  scoped_refptr<TabletPeer> tablet_peer;
-  RPC_RETURN_NOT_OK(tablet_peer_lookup_->GetTabletPeer(tablet_id, &tablet_peer),
+  scoped_refptr<TabletReplica> tablet_replica;
+  RPC_RETURN_NOT_OK(tablet_replica_lookup_->GetTabletReplica(tablet_id, &tablet_replica),
                     TabletCopyErrorPB::TABLET_NOT_FOUND,
                     Substitute("Unable to find specified tablet: $0", tablet_id),
                     context);
@@ -115,19 +126,21 @@ void TabletCopyServiceImpl::BeginTabletCopySession(
   scoped_refptr<TabletCopySourceSession> session;
   {
     MutexLock l(sessions_lock_);
-    if (!FindCopy(sessions_, session_id, &session)) {
+    const SessionEntry* session_entry = FindOrNull(sessions_, session_id);
+    if (!session_entry) {
       LOG_WITH_PREFIX(INFO) << Substitute(
           "Beginning new tablet copy session on tablet $0 from peer $1"
           " at $2: session id = $3",
           tablet_id, requestor_uuid, context->requestor_string(), session_id);
-      session.reset(new TabletCopySourceSession(tablet_peer, session_id,
-                                               requestor_uuid, fs_manager_));
+      session.reset(new TabletCopySourceSession(tablet_replica, session_id,
+                                                requestor_uuid, fs_manager_));
       RPC_RETURN_NOT_OK(session->Init(),
                         TabletCopyErrorPB::UNKNOWN_ERROR,
                         Substitute("Error beginning tablet copy session for tablet $0", tablet_id),
                         context);
-      InsertOrDie(&sessions_, session_id, session);
+      InsertOrDie(&sessions_, session_id, { session, GetNewExpireTime() });
     } else {
+      session = session_entry->session;
       LOG_WITH_PREFIX(INFO) << Substitute(
           "Re-sending initialization info for existing tablet copy session on tablet $0"
           " from peer $1 at $2: session_id = $3",
@@ -144,6 +157,19 @@ void TabletCopyServiceImpl::BeginTabletCopySession(
 
   for (const scoped_refptr<log::ReadableLogSegment>& segment : session->log_segments()) {
     resp->add_wal_segment_seqnos(segment->header().sequence_number());
+  }
+
+  // For testing: Close the session prematurely if unsafe gflag is set but
+  // still respond as if it was opened.
+  if (PREDICT_FALSE(FLAGS_tablet_copy_early_session_timeout_prob > 0 &&
+      rand_.NextDoubleFraction() <= FLAGS_tablet_copy_early_session_timeout_prob)) {
+    LOG_WITH_PREFIX(WARNING) << "Timing out tablet copy session due to flag "
+                             << "--tablet_copy_early_session_timeout_prob "
+                             << "being set to " << FLAGS_tablet_copy_early_session_timeout_prob;
+    MutexLock l(sessions_lock_);
+    TabletCopyErrorPB::Code app_error;
+    WARN_NOT_OK(TabletCopyServiceImpl::DoEndTabletCopySessionUnlocked(session_id, &app_error),
+                Substitute("Unable to forcibly end tablet copy session $0", session_id));
   }
 
   context->RespondSuccess();
@@ -250,15 +276,18 @@ void TabletCopyServiceImpl::Shutdown() {
   session_expiration_thread_->Join();
 
   // Destroy all tablet copy sessions.
-  vector<string> session_ids;
-  for (const MonoTimeMap::value_type& entry : session_expirations_) {
-    session_ids.push_back(entry.first);
-  }
-  for (const string& session_id : session_ids) {
+  MutexLock l(sessions_lock_);
+  auto iter = sessions_.cbegin();
+  while (iter != sessions_.cend()) {
+    const string& session_id = iter->first;
+    // Increment the iterator before erasing the corresponding session from the
+    // map in DoEndTabletCopySessionUnlocked().
+    ++iter; // Don't use until next iteration of the loop.
     LOG_WITH_PREFIX(INFO) << "Destroying tablet copy session " << session_id
                           << " due to service shutdown";
     TabletCopyErrorPB::Code app_error;
-    CHECK_OK(DoEndTabletCopySessionUnlocked(session_id, &app_error));
+    WARN_NOT_OK(DoEndTabletCopySessionUnlocked(session_id, &app_error),
+                "Unable to end tablet copy session during service shutdown");
   }
 }
 
@@ -266,11 +295,13 @@ Status TabletCopyServiceImpl::FindSessionUnlocked(
         const string& session_id,
         TabletCopyErrorPB::Code* app_error,
         scoped_refptr<TabletCopySourceSession>* session) const {
-  if (!FindCopy(sessions_, session_id, session)) {
+  const SessionEntry* session_entry = FindOrNull(sessions_, session_id);
+  if (!session_entry) {
     *app_error = TabletCopyErrorPB::NO_SESSION;
     return Status::NotFound(
         Substitute("Tablet Copy session with Session ID \"$0\" not found", session_id));
   }
+  *session = session_entry->session;
   return Status::OK();
 }
 
@@ -307,14 +338,15 @@ Status TabletCopyServiceImpl::ValidateFetchRequestDataId(
 }
 
 void TabletCopyServiceImpl::ResetSessionExpirationUnlocked(const std::string& session_id) {
-  MonoTime expiration(MonoTime::Now());
-  expiration.AddDelta(MonoDelta::FromMilliseconds(FLAGS_tablet_copy_idle_timeout_ms));
-  InsertOrUpdate(&session_expirations_, session_id, expiration);
+  SessionEntry* session_entry = FindOrNull(sessions_, session_id);
+  if (!session_entry) return;
+  session_entry->expires = GetNewExpireTime();
 }
 
 Status TabletCopyServiceImpl::DoEndTabletCopySessionUnlocked(
         const std::string& session_id,
         TabletCopyErrorPB::Code* app_error) {
+  sessions_lock_.AssertAcquired();
   scoped_refptr<TabletCopySourceSession> session;
   RETURN_NOT_OK(FindSessionUnlocked(session_id, app_error, &session));
   // Remove the session from the map.
@@ -322,8 +354,6 @@ Status TabletCopyServiceImpl::DoEndTabletCopySessionUnlocked(
   LOG_WITH_PREFIX(INFO) << "Ending tablet copy session " << session_id << " on tablet "
                         << session->tablet_id() << " with peer " << session->requestor_uuid();
   CHECK_EQ(1, sessions_.erase(session_id));
-  CHECK_EQ(1, session_expirations_.erase(session_id));
-
   return Status::OK();
 }
 
@@ -333,9 +363,9 @@ void TabletCopyServiceImpl::EndExpiredSessions() {
     const MonoTime now = MonoTime::Now();
 
     vector<string> expired_session_ids;
-    for (const MonoTimeMap::value_type& entry : session_expirations_) {
+    for (const auto& entry : sessions_) {
       const string& session_id = entry.first;
-      const MonoTime& expiration = entry.second;
+      const MonoTime& expiration = entry.second.expires;
       if (expiration < now) {
         expired_session_ids.push_back(session_id);
       }

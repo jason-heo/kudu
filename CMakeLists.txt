@@ -54,17 +54,13 @@ string(REPLACE "${CMAKE_CURRENT_SOURCE_DIR}/build/" ""
   BLESSED_BUILD_SUBDIR "${CMAKE_CURRENT_BINARY_DIR}")
 string(FIND "${BLESSED_BUILD_SUBDIR}" "/" SLASH_POS)
 if (SLASH_POS EQUAL -1)
-  if (NOT APPLE)
-    set(MORE_ARGS "-T")
-  endif()
-
   # Create the symlink both during cmake invocation and when the default target
   # ('all') is built. The former is useful for scripts that, after running
   # cmake, only build a single target (i.e. "make lint").
-  execute_process(COMMAND ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+  execute_process(COMMAND ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest)
   add_custom_target(latest_symlink ALL
-    ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+    ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest
     COMMENT "Recreating ../build/latest symlink")
 
@@ -246,15 +242,24 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
   # ATTRIBUTE_DEPRECATED in its signature.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wdocumentation-deprecated-sync")
 
+  # Avoid 'taking address of packed member' warnings, which pollute macOs/clang 4.0 builds.
+  # This is also done in chromium. See:
+  # https://bugs.chromium.org/p/chromium/issues/detail?id=619640
+  # Unfortunately older versions of clang complain about not knowing the warning, so
+  # this also disables the warning about unknown warnings.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unknown-warning-option -Wno-address-of-packed-member")
+
   # Only hardcode -fcolor-diagnostics if stderr is opened on a terminal. Otherwise
   # the color codes show up as noisy artifacts.
   #
   # This test is imperfect because 'cmake' and 'make' can be run independently
   # (with different terminal options), and we're testing during the former.
   #
-  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1.
+  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1 or
+  # by setting an environment variable of the same name.
   execute_process(COMMAND test -t 2 RESULT_VARIABLE KUDU_IS_TTY)
   if ((NOT "${KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
+      (NOT "$ENV{KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
       ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb"))))
     message("Running in a controlling terminal")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcolor-diagnostics")
@@ -884,8 +889,10 @@ ADD_THIRDPARTY_LIB(krb5
 ##
 ## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see comment
 ## near definition of KUDU_USING_GOLD).
+## As a workaround for KUDU-1998, tcmalloc is disabled in OS X builds.
 find_package(GPerf REQUIRED)
-if (NOT "${KUDU_USE_ASAN}" AND
+if (NOT APPLE AND
+    NOT "${KUDU_USE_ASAN}" AND
     NOT "${KUDU_USE_TSAN}" AND
     NOT ("${KUDU_USING_GOLD}" AND "${KUDU_LINK}" STREQUAL "d"))
   ADD_THIRDPARTY_LIB(tcmalloc

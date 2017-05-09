@@ -138,6 +138,7 @@ set(UTIL_SRCS
   file_cache.cc
   flags.cc
   flag_tags.cc
+  flag_validators.cc
   group_varint.cc
   pstack_watcher.cc
   hdr_histogram.cc
@@ -169,6 +170,7 @@ set(UTIL_SRCS
   path_util.cc
   pb_util.cc
   pb_util-internal.cc
+  process_memory.cc
   random_util.cc
   resettable_heartbeater.cc
   rolling_log.cc
@@ -340,6 +342,7 @@ ADD_KUDU_TEST(failure_detector-test)
 ADD_KUDU_TEST(file_cache-test)
 ADD_KUDU_TEST(file_cache-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(flag_tags-test)
+ADD_KUDU_TEST(flag_validators-test)
 ADD_KUDU_TEST(flags-test)
 ADD_KUDU_TEST(group_varint-test)
 ADD_KUDU_TEST(hash_util-test)
@@ -366,6 +369,7 @@ ADD_KUDU_TEST(oid_generator-test)
 ADD_KUDU_TEST(once-test)
 ADD_KUDU_TEST(os-util-test)
 ADD_KUDU_TEST(path_util-test)
+ADD_KUDU_TEST(process_memory-test RUN_SERIAL true)
 ADD_KUDU_TEST(random-test)
 ADD_KUDU_TEST(random_util-test)
 ADD_KUDU_TEST(resettable_heartbeater-test)

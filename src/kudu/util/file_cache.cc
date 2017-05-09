@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <gflags/gflags.h>
 
@@ -45,6 +46,7 @@ TAG_FLAG(file_cache_expiry_period_ms, advanced);
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -206,17 +208,28 @@ class Descriptor<RWFile> : public RWFile {
 
   ~Descriptor() = default;
 
-  Status Read(uint64_t offset, size_t length,
-              Slice* result, uint8_t* scratch) const override {
+  Status Read(uint64_t offset, Slice* result) const override {
     ScopedOpenedDescriptor<RWFile> opened(&base_);
     RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
-    return opened.file()->Read(offset, length, result, scratch);
+    return opened.file()->Read(offset, result);
+  }
+
+  Status ReadV(uint64_t offset, vector<Slice>* results) const override {
+    ScopedOpenedDescriptor<RWFile> opened(&base_);
+    RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
+    return opened.file()->ReadV(offset, results);
   }
 
   Status Write(uint64_t offset, const Slice& data) override {
     ScopedOpenedDescriptor<RWFile> opened(&base_);
     RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
     return opened.file()->Write(offset, data);
+  }
+
+  Status WriteV(uint64_t offset, const vector<Slice> &data) override {
+    ScopedOpenedDescriptor<RWFile> opened(&base_);
+    RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
+    return opened.file()->WriteV(offset, data);
   }
 
   Status PreAllocate(uint64_t offset, size_t length, PreAllocateMode mode) override {
@@ -258,6 +271,12 @@ class Descriptor<RWFile> : public RWFile {
     ScopedOpenedDescriptor<RWFile> opened(&base_);
     RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
     return opened.file()->Size(size);
+  }
+
+  Status GetExtentMap(ExtentMap* out) const override {
+    ScopedOpenedDescriptor<RWFile> opened(&base_);
+    RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
+    return opened.file()->GetExtentMap(out);
   }
 
   const string& filename() const override {
@@ -319,11 +338,16 @@ class Descriptor<RandomAccessFile> : public RandomAccessFile {
 
   ~Descriptor() = default;
 
-  Status Read(uint64_t offset, size_t n,
-              Slice* result, uint8_t *scratch) const override {
+  Status Read(uint64_t offset, Slice* result) const override {
     ScopedOpenedDescriptor<RandomAccessFile> opened(&base_);
     RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
-    return opened.file()->Read(offset, n, result, scratch);
+    return opened.file()->Read(offset, result);
+  }
+
+  Status ReadV(uint64_t offset, vector<Slice>* results) const override {
+    ScopedOpenedDescriptor<RandomAccessFile> opened(&base_);
+    RETURN_NOT_OK(ReopenFileIfNecessary(&opened));
+    return opened.file()->ReadV(offset, results);
   }
 
   Status Size(uint64_t *size) const override {

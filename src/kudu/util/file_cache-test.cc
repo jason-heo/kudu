@@ -83,7 +83,7 @@ class FileCacheTest : public KuduTest {
     ASSERT_EQ(initial_open_fds_ + num_expected_fds, CountOpenFds(env_));
 
     // The expiry thread may take some time to run.
-    AssertEventually([&]() {
+    ASSERT_EVENTUALLY([&]() {
       ASSERT_EQ(num_expected_descriptors, cache_->NumDescriptorsForTests());
     });
   }
@@ -253,8 +253,8 @@ TYPED_TEST(FileCacheTest, TestHeavyReads) {
     const auto& f = opened_files[idx];
     uint64_t size;
     ASSERT_OK(f->Size(&size));
-    Slice s;
-    ASSERT_OK(f->Read(0, size, &s, buf.get()));
+    Slice s(buf.get(), size);
+    ASSERT_OK(f->Read(0, &s));
     ASSERT_EQ(data, s);
     ASSERT_LE(CountOpenFds(this->env_),
               this->initial_open_fds_ + kCacheCapacity);

@@ -21,11 +21,15 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "kudu/fs/block_manager_metrics.h"
 #include "kudu/fs/block_manager_util.h"
 #include "kudu/fs/data_dirs.h"
 #include "kudu/fs/fs.pb.h"
+#include "kudu/fs/fs_report.h"
 #include "kudu/gutil/callback.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/map-util.h"
@@ -73,6 +77,13 @@ DEFINE_uint64(log_container_preallocate_bytes, 32LU * 1024 * 1024,
               "creating new blocks. Set to 0 to disable preallocation");
 TAG_FLAG(log_container_preallocate_bytes, advanced);
 
+DEFINE_double(log_container_excess_space_before_cleanup_fraction, 0.10,
+              "Additional fraction of a log container's calculated size that "
+              "must be consumed on disk before the container is considered to "
+              "be inconsistent and subject to excess space cleanup at block "
+              "manager startup.");
+TAG_FLAG(log_container_excess_space_before_cleanup_fraction, advanced);
+
 DEFINE_bool(log_block_manager_test_hole_punching, true,
             "Ensure hole punching is supported by the underlying filesystem");
 TAG_FLAG(log_block_manager_test_hole_punching, advanced);
@@ -116,6 +127,8 @@ using std::map;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_map;
+using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -155,6 +168,59 @@ LogBlockManagerMetrics::LogBlockManagerMetrics(const scoped_refptr<MetricEntity>
 #undef MINIT
 
 ////////////////////////////////////////////////////////////
+// LogBlock (declaration)
+////////////////////////////////////////////////////////////
+
+// The persistent metadata that describes a logical block.
+//
+// A block grows a LogBlock when its data has been synchronized with
+// the disk. That's when it's fully immutable (i.e. none of its metadata
+// can change), and when it becomes readable and persistent.
+//
+// LogBlocks are reference counted to simplify support for deletion with
+// outstanding readers. All refcount increments are performed with the
+// block manager lock held, as are deletion-based decrements. However,
+// no lock is held when ~LogReadableBlock decrements the refcount, thus it
+// must be made thread safe (by extending RefCountedThreadSafe instead of
+// the simpler RefCounted).
+class LogBlock : public RefCountedThreadSafe<LogBlock> {
+ public:
+  LogBlock(LogBlockContainer* container, BlockId block_id, int64_t offset,
+           int64_t length);
+  ~LogBlock();
+
+  const BlockId& block_id() const { return block_id_; }
+  LogBlockContainer* container() const { return container_; }
+  int64_t offset() const { return offset_; }
+  int64_t length() const { return length_; }
+
+  // Returns a block's length aligned to the nearest filesystem block size.
+  int64_t fs_aligned_length() const;
+
+  // Delete the block. Actual deletion takes place when the
+  // block is destructed.
+  void Delete();
+
+ private:
+  // The owning container. Must outlive the LogBlock.
+  LogBlockContainer* container_;
+
+  // The block identifier.
+  const BlockId block_id_;
+
+  // The block's offset in the container.
+  const int64_t offset_;
+
+  // The block's length.
+  const int64_t length_;
+
+  // Whether the block has been marked for deletion.
+  bool deleted_;
+
+  DISALLOW_COPY_AND_ASSIGN(LogBlock);
+};
+
+////////////////////////////////////////////////////////////
 // LogBlockContainer
 ////////////////////////////////////////////////////////////
 
@@ -183,9 +249,10 @@ class LogBlockContainer {
   //
   // Returns Status::Aborted() in the case that the metadata and data files
   // both appear to have no data (e.g. due to a crash just after creating
-  // one of them but before writing any records).
+  // one of them but before writing any records). This is recorded in 'report'.
   static Status Open(LogBlockManager* block_manager,
                      DataDir* dir,
+                     FsReport* report,
                      const std::string& id,
                      unique_ptr<LogBlockContainer>* container);
 
@@ -204,7 +271,7 @@ class LogBlockContainer {
   // is required to record the deletion in container metadata.
   //
   // The on-disk effects of this call are made durable only after SyncData().
-  Status DeleteBlock(int64_t offset, int64_t length);
+  Status PunchHole(int64_t offset, int64_t length);
 
   // Preallocate enough space to ensure that an append of 'next_append_length'
   // can be satisfied by this container. The offset of the beginning of this
@@ -215,14 +282,17 @@ class LogBlockContainer {
   Status EnsurePreallocated(int64_t block_start_offset,
                             size_t next_append_length);
 
-  // Writes 'data' to this container's data file at offset 'offset'.
-  //
-  // The on-disk effects of this call are made durable only after SyncData().
+  // See RWFile::Write()
   Status WriteData(int64_t offset, const Slice& data);
 
+  // See RWFile::WriteV()
+  Status WriteVData(int64_t offset, const vector<Slice>& data);
+
   // See RWFile::Read().
-  Status ReadData(int64_t offset, size_t length,
-                  Slice* result, uint8_t* scratch) const;
+  Status ReadData(int64_t offset, Slice* result) const;
+
+  // See RWFile::ReadV().
+  Status ReadVData(int64_t offset, vector<Slice>* results) const;
 
   // Appends 'pb' to this container's metadata file.
   //
@@ -254,27 +324,50 @@ class LogBlockContainer {
   // TODO(unknown): Add support to synchronize just a range.
   Status SyncMetadata();
 
-  // Truncates this container's data file to 'total_bytes_written_' if it is
+  // Reopen the metadata file record writer. Should be called if the underlying
+  // file was changed.
+  Status ReopenMetadataWriter();
+
+  // Truncates this container's data file to 'next_block_offset_' if it is
   // full. This effectively removes any preallocated but unused space.
   //
-  // Should be called only when 'total_bytes_written_' is up-to-date with
+  // Should be called only when 'next_block_offset_' is up-to-date with
   // respect to the data on disk (i.e. after the container's records have
   // been loaded), otherwise data may be lost!
   //
   // This function is thread unsafe.
-  Status TruncateDataToTotalBytesWritten();
+  Status TruncateDataToNextBlockOffset();
 
-  // Reads the container's metadata from disk, sanity checking and
-  // returning the records.
-  Status ReadContainerRecords(deque<BlockRecordPB>* records) const;
+  // Reads the container's metadata from disk, sanity checking and processing
+  // records along the way.
+  //
+  // Malformed records and other container inconsistencies are written to
+  // 'report'. Healthy blocks are written either to 'live_blocks' or
+  // 'dead_blocks'. The greatest block ID seen thus far in the container is
+  // written to 'max_block_id'.
+  //
+  // Returns an error only if there was a problem accessing the container from
+  // disk; such errors are fatal and effectively halt processing immediately.
+  Status ProcessRecords(
+      FsReport* report,
+      LogBlockManager::UntrackedBlockMap* live_blocks,
+      std::vector<scoped_refptr<internal::LogBlock>>* dead_blocks,
+      uint64_t* max_block_id);
 
-  // Updates 'total_bytes_written_' and 'total_blocks_written_', marking this
-  // container as full if needed. Should only be called when a block is fully
-  // written, as it will round up the container data file's position.
+  // Updates internal bookkeeping state to reflect the creation of a block,
+  // marking this container as full if needed. Should only be called when a
+  // block is fully written, as it will round up the container data file's position.
   //
   // This function is thread unsafe.
-  void UpdateBytesWrittenAndTotalBlocks(int64_t block_offset,
-                                        size_t block_length);
+  void BlockCreated(const scoped_refptr<LogBlock>& block);
+
+  // Updates internal bookkeeping state to reflect the deletion of a block.
+  //
+  // Unlike BlockCreated(), this function is thread safe because block
+  // deletions can happen concurrently with creations.
+  //
+  // Note: the container is not made "unfull"; containers remain sparse until deleted.
+  void BlockDeleted(const scoped_refptr<LogBlock>& block);
 
   // Run a task on this container's data directory thread pool.
   //
@@ -287,10 +380,18 @@ class LogBlockContainer {
 
   // Simple accessors.
   LogBlockManager* block_manager() const { return block_manager_; }
-  int64_t total_bytes_written() const { return total_bytes_written_; }
+  int64_t next_block_offset() const { return next_block_offset_; }
+  int64_t total_bytes() const { return total_bytes_; }
+  int64_t total_blocks() const { return total_blocks_; }
+  int64_t live_bytes() const { return live_bytes_.Load(); }
+  int64_t live_bytes_aligned() const { return live_bytes_aligned_.Load(); }
+  int64_t live_blocks() const { return live_blocks_.Load(); }
+  int64_t preallocated_window() const {
+    return std::max<int64_t>(0, preallocated_offset_ - next_block_offset_);
+  }
   bool full() const {
-    return total_bytes_written_ >= FLAGS_log_container_max_size ||
-        (max_num_blocks_ && (total_blocks_written_ >= max_num_blocks_));
+    return next_block_offset_ >= FLAGS_log_container_max_size ||
+        (max_num_blocks_ && (total_blocks_ >= max_num_blocks_));
   }
   const LogBlockManagerMetrics* metrics() const { return metrics_; }
   const DataDir* data_dir() const { return data_dir_; }
@@ -302,10 +403,23 @@ class LogBlockContainer {
                     unique_ptr<WritablePBContainerFile> metadata_file,
                     shared_ptr<RWFile> data_file);
 
-  // Performs sanity checks on a block record.
-  Status CheckBlockRecord(const BlockRecordPB& record,
-                          uint64_t data_file_size,
-                          uint64_t fs_block_size) const;
+  // Processes a single block record, performing sanity checks on it and adding
+  // it either to 'live_blocks' or 'dead_blocks'.
+  //
+  // Returns an error only if there was a problem accessing the container from
+  // disk; such errors are fatal and effectively halt processing immediately.
+  //
+  // On success, 'report' is updated with any inconsistencies found in the
+  // record, 'data_file_size' may be updated with the latest size of the
+  // container's data file, and 'max_block_id' reflects the largest block ID
+  // seen thus far in the container.
+  Status ProcessRecord(
+      const BlockRecordPB& record,
+      FsReport* report,
+      LogBlockManager::UntrackedBlockMap* live_blocks,
+      std::vector<scoped_refptr<internal::LogBlock>>* dead_blocks,
+      uint64_t* data_file_size,
+      uint64_t* max_block_id);
 
   // The owning block manager. Must outlive the container itself.
   LogBlockManager* const block_manager_;
@@ -322,11 +436,30 @@ class LogBlockContainer {
   unique_ptr<WritablePBContainerFile> metadata_file_;
   shared_ptr<RWFile> data_file_;
 
-  // The amount of data written thus far in the container.
-  int64_t total_bytes_written_ = 0;
+  // The offset of the next block to be written to the container.
+  int64_t next_block_offset_ = 0;
+
+  // The amount of data (post block alignment) written thus far to the container.
+  int64_t total_bytes_ = 0;
 
   // The number of blocks written thus far in the container.
-  int64_t total_blocks_written_ = 0;
+  int64_t total_blocks_ = 0;
+
+  // The amount of data present in not-yet-deleted blocks of the container.
+  //
+  // Declared atomic because it is mutated from BlockDeleted().
+  AtomicInt<int64_t> live_bytes_;
+
+  // The amount of data (post block alignment) present in not-yet-deleted
+  // blocks of the container.
+  //
+  // Declared atomic because it is mutated from BlockDeleted().
+  AtomicInt<int64_t> live_bytes_aligned_;
+
+  // The number of not-yet-deleted blocks in the container.
+  //
+  // Declared atomic because it is mutated from BlockDeleted().
+  AtomicInt<int64_t> live_blocks_;
 
   // The metrics. Not owned by the log container; it has the same lifespan
   // as the block manager.
@@ -346,6 +479,9 @@ LogBlockContainer::LogBlockContainer(
                                 data_dir)),
       metadata_file_(std::move(metadata_file)),
       data_file_(std::move(data_file)),
+      live_bytes_(0),
+      live_bytes_aligned_(0),
+      live_blocks_(0),
       metrics_(block_manager->metrics()) {
 }
 
@@ -421,6 +557,7 @@ Status LogBlockContainer::Create(LogBlockManager* block_manager,
 
 Status LogBlockContainer::Open(LogBlockManager* block_manager,
                                DataDir* dir,
+                               FsReport* report,
                                const string& id,
                                unique_ptr<LogBlockContainer>* container) {
   Env* env = block_manager->env();
@@ -437,31 +574,18 @@ Status LogBlockContainer::Open(LogBlockManager* block_manager,
     uint64_t metadata_size = 0;
     uint64_t data_size = 0;
     Status s = env->GetFileSize(metadata_path, &metadata_size);
-    if (s.IsNotFound()) {
-      LOG(WARNING) << "Missing metadata path at " << metadata_path;
-    } else {
+    if (!s.IsNotFound()) {
       RETURN_NOT_OK_PREPEND(s, "unable to determine metadata file size");
     }
     s = env->GetFileSize(data_path, &data_size);
-    if (s.IsNotFound()) {
-      LOG(WARNING) << "Missing data path at " << data_path;
-    } else {
+    if (!s.IsNotFound()) {
       RETURN_NOT_OK_PREPEND(s, "unable to determine data file size");
     }
 
     if (metadata_size < pb_util::kPBContainerMinimumValidLength &&
         data_size == 0) {
-      bool ro = block_manager->read_only_;
-      LOG(WARNING) << Substitute(
-          "Data and metadata files for container $0 are both missing or empty: $1",
-          common_path, ro ? "ignoring" : "deleting container");
-      if (!ro) {
-        IgnoreResult(env->DeleteFile(metadata_path));
-        IgnoreResult(env->DeleteFile(data_path));
-      }
-      return Status::Aborted(Substitute(
-          "orphaned empty metadata and data files $0",
-          ro ? "ignored" : "removed"));
+      report->incomplete_container_check->entries.emplace_back(common_path);
+      return Status::Aborted("orphaned empty metadata and data files $0");
     }
   }
 
@@ -502,128 +626,147 @@ Status LogBlockContainer::Open(LogBlockManager* block_manager,
 
   // Create the in-memory container and populate it.
   unique_ptr<LogBlockContainer> open_container(new LogBlockContainer(block_manager,
-                                                                      dir,
-                                                                      std::move(metadata_pb_writer),
-                                                                      std::move(data_file)));
+                                                                     dir,
+                                                                     std::move(metadata_pb_writer),
+                                                                     std::move(data_file)));
   open_container->preallocated_offset_ = data_file_size;
   VLOG(1) << "Opened log block container " << open_container->ToString();
   container->swap(open_container);
   return Status::OK();
 }
 
-Status LogBlockContainer::TruncateDataToTotalBytesWritten() {
-  // Truncation is performed even if the container's logical file size
-  // (available by proxy via preallocated_offset_) and total_bytes_written_
-  // agree, because XFS's speculative preallocation feature may artificially
-  // enlarge the file without updating its file size.
-  //
-  // See KUDU-1856 for more details.
+Status LogBlockContainer::TruncateDataToNextBlockOffset() {
   if (full()) {
     VLOG(2) << Substitute("Truncating container $0 to offset $1",
-                          ToString(), total_bytes_written_);
-    RETURN_NOT_OK(data_file_->Truncate(total_bytes_written_));
+                          ToString(), next_block_offset_);
+    RETURN_NOT_OK(data_file_->Truncate(next_block_offset_));
   }
   return Status::OK();
 }
 
-Status LogBlockContainer::ReadContainerRecords(deque<BlockRecordPB>* records) const {
+Status LogBlockContainer::ProcessRecords(
+    FsReport* report,
+    LogBlockManager::UntrackedBlockMap* live_blocks,
+    vector<scoped_refptr<internal::LogBlock>>* dead_blocks,
+    uint64_t* max_block_id) {
   string metadata_path = metadata_file_->filename();
   unique_ptr<RandomAccessFile> metadata_reader;
   RETURN_NOT_OK(block_manager()->env()->NewRandomAccessFile(metadata_path, &metadata_reader));
   ReadablePBContainerFile pb_reader(std::move(metadata_reader));
   RETURN_NOT_OK(pb_reader.Open());
 
-  uint64_t data_file_size;
-  RETURN_NOT_OK(data_file_->Size(&data_file_size));
-  uint64_t fs_block_size =
-      data_dir_->instance()->metadata()->filesystem_block_size_bytes();
-  deque<BlockRecordPB> local_records;
+  uint64_t data_file_size = 0;
   Status read_status;
   while (true) {
-    local_records.resize(local_records.size() + 1);
-    read_status = pb_reader.ReadNextPB(&local_records.back());
+    BlockRecordPB record;
+    read_status = pb_reader.ReadNextPB(&record);
     if (!read_status.ok()) {
-      // Drop the last element; we didn't use it.
-      local_records.pop_back();
       break;
     }
-
-    const auto& record = local_records.back();
-    if (PREDICT_FALSE(data_file_size < record.offset() + record.length())) {
-      // KUDU-1657: When opening a container in read-only mode which is actively
-      // being written to by another lbm, we must reinspect the data file's size
-      // frequently in order to account for the latest appends. Inspecting the
-      // file size is expensive, so we only do it when the metadata indicates
-      // that additional data has been written to the file.
-      RETURN_NOT_OK(data_file_->Size(&data_file_size));
-    }
-    RETURN_NOT_OK(CheckBlockRecord(record, data_file_size, fs_block_size));
+    RETURN_NOT_OK(ProcessRecord(record, report,
+                                live_blocks, dead_blocks,
+                                &data_file_size, max_block_id));
   }
+
   // NOTE: 'read_status' will never be OK here.
   if (PREDICT_TRUE(read_status.IsEndOfFile())) {
     // We've reached the end of the file without any problems.
-    records->swap(local_records);
     return Status::OK();
   }
   if (read_status.IsIncomplete()) {
     // We found a partial trailing record in a version of the pb container file
     // format that can reliably detect this. Consider this a failed partial
     // write and truncate the metadata file to remove this partial record.
-    LOG(WARNING) << Substitute(
-        "Log block manager: Found partial trailing metadata record in "
-        "container $0: $1",
-        ToString(), block_manager()->read_only_ ?
-            "ignoring" :
-            Substitute("truncating metadata file to last valid offset: $0",
-                       pb_reader.offset()));
-    if (!block_manager()->read_only_) {
-      unique_ptr<RWFile> file;
-      RWFileOptions opts;
-      opts.mode = Env::OPEN_EXISTING;
-      RETURN_NOT_OK(block_manager_->env()->NewRWFile(opts, metadata_path, &file));
-      RETURN_NOT_OK(file->Truncate(pb_reader.offset()));
-      RETURN_NOT_OK(file->Close());
-
-      // Reopen the PB writer so that it will refresh its metadata about the
-      // underlying file and resume appending to the new end of the file.
-      RETURN_NOT_OK(metadata_file_->Reopen());
-    }
-    records->swap(local_records);
+    report->partial_record_check->entries.emplace_back(ToString(),
+                                                       pb_reader.offset());
     return Status::OK();
   }
   // If we've made it here, we've found (and are returning) an unrecoverable error.
   return read_status;
 }
 
-Status LogBlockContainer::CheckBlockRecord(const BlockRecordPB& record,
-                                           uint64_t data_file_size,
-                                           uint64_t fs_block_size) const {
-  if (record.op_type() == CREATE) {
-    if (!record.has_offset() ||
-        !record.has_length() ||
-        record.offset() < 0  ||
-        record.length() < 0) {
-      return Status::Corruption(Substitute(
-          "Found malformed block record in data file: $0\nRecord: $1\n",
-          data_file_->filename(), SecureDebugString(record)));
-    }
-    if (record.offset() + record.length() > data_file_size) {
-      return Status::Corruption(Substitute(
-          "Found block extending beyond the end of data file: $0\n"
-          "Record: $1\nData file size: $2",
-          data_file_->filename(), SecureDebugString(record), data_file_size));
-    }
+Status LogBlockContainer::ProcessRecord(
+    const BlockRecordPB& record,
+    FsReport* report,
+    LogBlockManager::UntrackedBlockMap* live_blocks,
+    vector<scoped_refptr<internal::LogBlock>>* dead_blocks,
+    uint64_t* data_file_size,
+    uint64_t* max_block_id) {
+  BlockId block_id(BlockId::FromPB(record.block_id()));
+  scoped_refptr<LogBlock> lb;
+  switch (record.op_type()) {
+    case CREATE:
+      // First verify that the record's offset/length aren't wildly incorrect.
+      if (PREDICT_FALSE(!record.has_offset() ||
+                        !record.has_length() ||
+                        record.offset() < 0  ||
+                        record.length() < 0)) {
+        report->malformed_record_check->entries.emplace_back(ToString(), record);
+        break;
+      }
 
-    // We could also check that the record's offset is aligned with the
-    // underlying filesystem's block size, an invariant maintained by the log
-    // block manager. However, due to KUDU-1793, that invariant may have been
-    // broken, so we'll LOG but otherwise allow it.
-    if (record.offset() % fs_block_size != 0) {
-      LOG(WARNING) << Substitute(
-          "Found misaligned block in data file: $0\nRecord: $1\n"
-          "This is likely because of KUDU-1793",
-          data_file_->filename(), SecureDebugString(record));
-    }
+      // Now it should be safe to access the record's offset/length.
+      //
+      // KUDU-1657: When opening a container in read-only mode which is actively
+      // being written to by another lbm, we must reinspect the data file's size
+      // frequently in order to account for the latest appends. Inspecting the
+      // file size is expensive, so we only do it when the metadata indicates
+      // that additional data has been written to the file.
+      if (PREDICT_FALSE(record.offset() + record.length() > *data_file_size)) {
+        RETURN_NOT_OK(data_file_->Size(data_file_size));
+      }
+
+      // If the record still extends beyond the end of the file, it is malformed.
+      if (PREDICT_FALSE(record.offset() + record.length() > *data_file_size)) {
+        // TODO(adar): treat as a different kind of inconsistency?
+        report->malformed_record_check->entries.emplace_back(ToString(), record);
+        break;
+      }
+
+      lb = new LogBlock(this, block_id, record.offset(), record.length());
+      if (!InsertIfNotPresent(live_blocks, block_id, lb)) {
+        // We found a record whose ID matches that of an already created block.
+        //
+        // TODO(adar): treat as a different kind of inconsistency?
+        report->malformed_record_check->entries.emplace_back(
+            ToString(), record);
+        break;
+      }
+
+      VLOG(2) << Substitute("Found CREATE block $0 at offset $1 with length $2",
+                            block_id.ToString(),
+                            record.offset(), record.length());
+
+      // This block must be included in the container's logical size, even if
+      // it has since been deleted. This helps satisfy one of our invariants:
+      // once a container byte range has been used, it may never be reused in
+      // the future.
+      //
+      // If we ignored deleted blocks, we would end up reusing the space
+      // belonging to the last deleted block in the container.
+      BlockCreated(lb);
+
+      *max_block_id = std::max(*max_block_id, block_id.id());
+      break;
+    case DELETE:
+      lb = EraseKeyReturnValuePtr(live_blocks, block_id);
+      if (!lb) {
+        // We found a record for which there is no already created block.
+        //
+        // TODO(adar): treat as a different kind of inconsistency?
+        report->malformed_record_check->entries.emplace_back(ToString(), record);
+        break;
+      }
+      VLOG(2) << Substitute("Found DELETE block $0", block_id.ToString());
+      BlockDeleted(lb);
+      dead_blocks->emplace_back(std::move(lb));
+      break;
+    default:
+      // We found a record with an unknown type.
+      //
+      // TODO(adar): treat as a different kind of inconsistency?
+      report->malformed_record_check->entries.emplace_back(ToString(), record);
+      break;
   }
   return Status::OK();
 }
@@ -646,11 +789,10 @@ Status LogBlockContainer::FinishBlock(const Status& s, WritableBlock* block) {
   // will have written some garbage that can be expunged during a GC.
   RETURN_NOT_OK(block_manager()->SyncContainer(*this));
 
-  CHECK(block_manager()->AddLogBlock(this, block->id(),
-                                     total_bytes_written_,
-                                     block->BytesAppended()));
-  UpdateBytesWrittenAndTotalBlocks(total_bytes_written_,
-                                   block->BytesAppended());
+  scoped_refptr<LogBlock> lb = block_manager()->AddLogBlock(
+      this, block->id(), next_block_offset_, block->BytesAppended());
+  CHECK(lb);
+  BlockCreated(lb);
 
   // Truncate the container if it's now full; any left over preallocated space
   // is no longer needed.
@@ -658,7 +800,7 @@ Status LogBlockContainer::FinishBlock(const Status& s, WritableBlock* block) {
   // Note that this take places _after_ the container has been synced to disk.
   // That's OK; truncation isn't needed for correctness, and in the event of a
   // crash, it will be retried at startup.
-  RETURN_NOT_OK(TruncateDataToTotalBytesWritten());
+  RETURN_NOT_OK(TruncateDataToNextBlockOffset());
 
   if (full() && block_manager()->metrics()) {
     block_manager()->metrics()->full_containers->Increment();
@@ -666,45 +808,51 @@ Status LogBlockContainer::FinishBlock(const Status& s, WritableBlock* block) {
   return Status::OK();
 }
 
-Status LogBlockContainer::DeleteBlock(int64_t offset, int64_t length) {
+Status LogBlockContainer::PunchHole(int64_t offset, int64_t length) {
   DCHECK_GE(offset, 0);
   DCHECK_GE(length, 0);
 
-  // Guaranteed by UpdateBytesWritten().
-  DCHECK_EQ(0, offset % instance()->filesystem_block_size_bytes());
-
   // It is invalid to punch a zero-size hole.
   if (length) {
-    // Round up to the nearest filesystem block so that the kernel will
-    // actually reclaim disk space.
-    //
     // It's OK if we exceed the file's total size; the kernel will truncate
     // our request.
-    return data_file_->PunchHole(offset, KUDU_ALIGN_UP(
-        length, instance()->filesystem_block_size_bytes()));
+    return data_file_->PunchHole(offset, length);
   }
   return Status::OK();
 }
 
 Status LogBlockContainer::WriteData(int64_t offset, const Slice& data) {
-  DCHECK_GE(offset, total_bytes_written_);
+  return WriteVData(offset, { data });
+}
 
-  RETURN_NOT_OK(data_file_->Write(offset, data));
+Status LogBlockContainer::WriteVData(int64_t offset, const vector<Slice>& data) {
+  DCHECK_GE(offset, next_block_offset_);
+
+  RETURN_NOT_OK(data_file_->WriteV(offset, data));
 
   // This append may have changed the container size if:
   // 1. It was large enough that it blew out the preallocated space.
   // 2. Preallocation was disabled.
-  if (offset + data.size() > preallocated_offset_) {
+  size_t data_size = accumulate(data.begin(), data.end(), static_cast<size_t>(0),
+                                [&](int sum, const Slice& curr) {
+                                  return sum + curr.size();
+                                });
+  if (offset + data_size > preallocated_offset_) {
     RETURN_NOT_OK(data_dir_->RefreshIsFull(DataDir::RefreshMode::ALWAYS));
   }
   return Status::OK();
 }
 
-Status LogBlockContainer::ReadData(int64_t offset, size_t length,
-                                   Slice* result, uint8_t* scratch) const {
+Status LogBlockContainer::ReadData(int64_t offset, Slice* result) const {
   DCHECK_GE(offset, 0);
 
-  return data_file_->Read(offset, length, result, scratch);
+  return data_file_->Read(offset, result);
+}
+
+Status LogBlockContainer::ReadVData(int64_t offset, vector<Slice>* results) const {
+  DCHECK_GE(offset, 0);
+
+  return data_file_->ReadV(offset, results);
 }
 
 Status LogBlockContainer::AppendMetadata(const BlockRecordPB& pb) {
@@ -737,6 +885,10 @@ Status LogBlockContainer::SyncMetadata() {
   return Status::OK();
 }
 
+Status LogBlockContainer::ReopenMetadataWriter() {
+  return metadata_file_->Reopen();
+}
+
 Status LogBlockContainer::EnsurePreallocated(int64_t block_start_offset,
                                              size_t next_append_length) {
   DCHECK_GE(block_start_offset, 0);
@@ -762,36 +914,50 @@ Status LogBlockContainer::EnsurePreallocated(int64_t block_start_offset,
   return Status::OK();
 }
 
-void LogBlockContainer::UpdateBytesWrittenAndTotalBlocks(int64_t block_offset,
-                                                         size_t block_length) {
-  DCHECK_GE(block_offset, 0);
+void LogBlockContainer::BlockCreated(const scoped_refptr<LogBlock>& block) {
+  DCHECK_GE(block->offset(), 0);
 
   // The log block manager maintains block contiguity as an invariant, which
   // means accounting for the new block should be as simple as adding its
-  // length to 'total_bytes_written_'. However, due to KUDU-1793, some
-  // containers may have developed extra "holes" between blocks. We'll account
-  // for that by considering both the block's offset and its length.
+  // aligned length to 'next_block_offset_'. However, due to KUDU-1793, some
+  // containers may have developed gaps between blocks. We'll account for them
+  // by considering both the block's offset and its length.
   //
   // The number of bytes is rounded up to the nearest filesystem block so
   // that each Kudu block is guaranteed to be on a filesystem block
   // boundary. This guarantees that the disk space can be reclaimed when
   // the block is deleted.
-  int64_t new_total_bytes = KUDU_ALIGN_UP(
-      block_offset + block_length, instance()->filesystem_block_size_bytes());
-  if (new_total_bytes < total_bytes_written_) {
+  int64_t new_next_block_offset = KUDU_ALIGN_UP(
+      block->offset() + block->length(),
+      instance()->filesystem_block_size_bytes());
+  if (PREDICT_FALSE(new_next_block_offset < next_block_offset_)) {
     LOG(WARNING) << Substitute(
-        "Container $0 unexpectedly tried to lower its size (from $1 to $2 "
-        "bytes), ignoring", ToString(), total_bytes_written_, new_total_bytes);
+        "Container $0 unexpectedly tried to lower its next block offset "
+        "(from $1 to $2), ignoring",
+        ToString(), next_block_offset_, new_next_block_offset);
+  } else {
+    int64_t aligned_block_length = new_next_block_offset - next_block_offset_;
+    total_bytes_+= aligned_block_length;
+    live_bytes_.IncrementBy(block->length());
+    live_bytes_aligned_.IncrementBy(aligned_block_length);
+    next_block_offset_ = new_next_block_offset;
   }
-  total_bytes_written_ = std::max(total_bytes_written_, new_total_bytes);
-
-  total_blocks_written_++;
+  total_blocks_++;
+  live_blocks_.Increment();
 
   if (full()) {
     VLOG(1) << Substitute(
         "Container $0 with size $1 is now full, max size is $2",
-        ToString(), total_bytes_written_, FLAGS_log_container_max_size);
+        ToString(), next_block_offset_, FLAGS_log_container_max_size);
   }
+}
+
+void LogBlockContainer::BlockDeleted(const scoped_refptr<LogBlock>& block) {
+  DCHECK_GE(block->offset(), 0);
+
+  live_bytes_.IncrementBy(-block->length());
+  live_bytes_aligned_.IncrementBy(-block->fs_aligned_length());
+  live_blocks_.IncrementBy(-1);
 }
 
 void LogBlockContainer::ExecClosure(const Closure& task) {
@@ -806,54 +972,8 @@ string LogBlockContainer::ToString() const {
 }
 
 ////////////////////////////////////////////////////////////
-// LogBlock
+// LogBlock (definition)
 ////////////////////////////////////////////////////////////
-
-// The persistent metadata that describes a logical block.
-//
-// A block grows a LogBlock when its data has been synchronized with
-// the disk. That's when it's fully immutable (i.e. none of its metadata
-// can change), and when it becomes readable and persistent.
-//
-// LogBlocks are reference counted to simplify support for deletion with
-// outstanding readers. All refcount increments are performed with the
-// block manager lock held, as are deletion-based decrements. However,
-// no lock is held when ~LogReadableBlock decrements the refcount, thus it
-// must be made thread safe (by extending RefCountedThreadSafe instead of
-// the simpler RefCounted).
-class LogBlock : public RefCountedThreadSafe<LogBlock> {
- public:
-  LogBlock(LogBlockContainer* container, BlockId block_id, int64_t offset,
-           int64_t length);
-  ~LogBlock();
-
-  const BlockId& block_id() const { return block_id_; }
-  LogBlockContainer* container() const { return container_; }
-  int64_t offset() const { return offset_; }
-  int64_t length() const { return length_; }
-
-  // Delete the block. Actual deletion takes place when the
-  // block is destructed.
-  void Delete();
-
- private:
-  // The owning container. Must outlive the LogBlock.
-  LogBlockContainer* container_;
-
-  // The block identifier.
-  const BlockId block_id_;
-
-  // The block's offset in the container.
-  const int64_t offset_;
-
-  // The block's length.
-  const int64_t length_;
-
-  // Whether the block has been marked for deletion.
-  bool deleted_;
-
-  DISALLOW_COPY_AND_ASSIGN(LogBlock);
-};
 
 LogBlock::LogBlock(LogBlockContainer* container, BlockId block_id,
                    int64_t offset, int64_t length)
@@ -869,20 +989,40 @@ LogBlock::LogBlock(LogBlockContainer* container, BlockId block_id,
 static void DeleteBlockAsync(LogBlockContainer* container,
                              BlockId block_id,
                              int64_t offset,
-                             int64_t length) {
+                             int64_t fs_aligned_length) {
   // We don't call SyncData() to synchronize the deletion because it's
   // expensive, and in the worst case, we'll just leave orphaned data
   // behind to be cleaned up in the next GC.
   VLOG(3) << "Freeing space belonging to block " << block_id;
-  WARN_NOT_OK(container->DeleteBlock(offset, length),
+  WARN_NOT_OK(container->PunchHole(offset, fs_aligned_length),
               Substitute("Could not delete block $0", block_id.ToString()));
 }
 
 LogBlock::~LogBlock() {
   if (deleted_) {
+    // Use the block's aligned length so that the filesystem can reclaim
+    // maximal disk space.
     container_->ExecClosure(Bind(&DeleteBlockAsync, container_, block_id_,
-                                 offset_, length_));
+                                 offset_, fs_aligned_length()));
   }
+}
+
+int64_t LogBlock::fs_aligned_length() const {
+  uint64_t fs_block_size = container_->instance()->filesystem_block_size_bytes();
+
+  // Nearly all blocks are placed on a filesystem block boundary, which means
+  // their length post-alignment is simply their length aligned up to the
+  // nearest fs block size.
+  //
+  // However, due to KUDU-1793, some blocks may start or end at misaligned
+  // offsets. We don't maintain enough state to precisely pinpoint such a
+  // block's (aligned) end offset in this case, so we'll just undercount it.
+  // This should be safe, although it may mean unreclaimed disk space (i.e.
+  // when fs_aligned_length() is used in hole punching).
+  if (PREDICT_TRUE(offset_ % fs_block_size == 0)) {
+    return KUDU_ALIGN_UP(length_, fs_block_size);
+  }
+  return length_;
 }
 
 void LogBlock::Delete() {
@@ -919,6 +1059,8 @@ class LogWritableBlock : public WritableBlock {
   virtual BlockManager* block_manager() const OVERRIDE;
 
   virtual Status Append(const Slice& data) OVERRIDE;
+
+  virtual Status AppendV(const vector<Slice>& data) OVERRIDE;
 
   virtual Status FlushDataAsync() OVERRIDE;
 
@@ -999,18 +1141,28 @@ BlockManager* LogWritableBlock::block_manager() const {
 }
 
 Status LogWritableBlock::Append(const Slice& data) {
+  return AppendV({ data });
+}
+
+Status LogWritableBlock::AppendV(const vector<Slice>& data) {
   DCHECK(state_ == CLEAN || state_ == DIRTY)
-      << "Invalid state: " << state_;
+  << "Invalid state: " << state_;
+
+  // Calculate the amount of data to write
+  size_t data_size = accumulate(data.begin(), data.end(), static_cast<size_t>(0),
+                                [&](int sum, const Slice& curr) {
+                                  return sum + curr.size();
+                                });
 
   // The metadata change is deferred to Close() or FlushDataAsync(),
   // whichever comes first. We can't do it now because the block's
   // length is still in flux.
 
   int64_t cur_block_offset = block_offset_ + block_length_;
-  RETURN_NOT_OK(container_->EnsurePreallocated(cur_block_offset, data.size()));
+  RETURN_NOT_OK(container_->EnsurePreallocated(cur_block_offset, data_size));
 
   MicrosecondsInt64 start_time = GetMonoTimeMicros();
-  RETURN_NOT_OK(container_->WriteData(cur_block_offset, data));
+  RETURN_NOT_OK(container_->WriteVData(cur_block_offset, data));
   MicrosecondsInt64 end_time = GetMonoTimeMicros();
 
   int64_t dur = end_time - start_time;
@@ -1018,7 +1170,7 @@ Status LogWritableBlock::Append(const Slice& data) {
   const char* counter = BUCKETED_COUNTER_NAME("lbm_writes", dur);
   TRACE_COUNTER_INCREMENT(counter, 1);
 
-  block_length_ += data.size();
+  block_length_ += data_size;
   state_ = DIRTY;
   return Status::OK();
 }
@@ -1126,8 +1278,9 @@ class LogReadableBlock : public ReadableBlock {
 
   virtual Status Size(uint64_t* sz) const OVERRIDE;
 
-  virtual Status Read(uint64_t offset, size_t length,
-                      Slice* result, uint8_t* scratch) const OVERRIDE;
+  virtual Status Read(uint64_t offset, Slice* result) const OVERRIDE;
+
+  virtual Status ReadV(uint64_t offset, vector<Slice>* results) const OVERRIDE;
 
   virtual size_t memory_footprint() const OVERRIDE;
 
@@ -1183,22 +1336,31 @@ Status LogReadableBlock::Size(uint64_t* sz) const {
   return Status::OK();
 }
 
-Status LogReadableBlock::Read(uint64_t offset, size_t length,
-                              Slice* result, uint8_t* scratch) const {
+Status LogReadableBlock::Read(uint64_t offset, Slice* result) const {
+  vector<Slice> results = { *result };
+  return ReadV(offset, &results);
+}
+
+Status LogReadableBlock::ReadV(uint64_t offset, vector<Slice>* results) const {
   DCHECK(!closed_.Load());
 
+  size_t read_length = accumulate(results->begin(), results->end(), static_cast<size_t>(0),
+                                  [&](int sum, const Slice& curr) {
+                                    return sum + curr.size();
+                                  });
+
   uint64_t read_offset = log_block_->offset() + offset;
-  if (log_block_->length() < offset + length) {
+  if (log_block_->length() < offset + read_length) {
     return Status::IOError("Out-of-bounds read",
                            Substitute("read of [$0-$1) in block [$2-$3)",
                                       read_offset,
-                                      read_offset + length,
+                                      read_offset + read_length,
                                       log_block_->offset(),
                                       log_block_->offset() + log_block_->length()));
   }
 
   MicrosecondsInt64 start_time = GetMonoTimeMicros();
-  RETURN_NOT_OK(container_->ReadData(read_offset, length, result, scratch));
+  RETURN_NOT_OK(container_->ReadVData(read_offset, results));
   MicrosecondsInt64 end_time = GetMonoTimeMicros();
 
   int64_t dur = end_time - start_time;
@@ -1208,7 +1370,7 @@ Status LogReadableBlock::Read(uint64_t offset, size_t length,
   TRACE_COUNTER_INCREMENT(counter, 1);
 
   if (container_->metrics()) {
-    container_->metrics()->generic_metrics.total_bytes_read->IncrementBy(length);
+    container_->metrics()->generic_metrics.total_bytes_read->IncrementBy(read_length);
   }
   return Status::OK();
 }
@@ -1291,7 +1453,7 @@ LogBlockManager::~LogBlockManager() {
   // them down before destroying the containers.
   dd_manager_.Shutdown();
 
-  STLDeleteElements(&all_containers_);
+  STLDeleteValues(&all_containers_by_name_);
 }
 
 Status LogBlockManager::Create() {
@@ -1301,7 +1463,7 @@ Status LogBlockManager::Create() {
       DataDirManager::FLAG_CREATE_TEST_HOLE_PUNCH);
 }
 
-Status LogBlockManager::Open() {
+Status LogBlockManager::Open(FsReport* report) {
   DataDirManager::LockMode mode;
   if (!FLAGS_block_manager_lock_dirs) {
     mode = DataDirManager::LockMode::NONE;
@@ -1358,6 +1520,7 @@ Status LogBlockManager::Open() {
     InsertOrDie(&block_limits_by_data_dir_, dd.get(), limit);
   }
 
+  vector<FsReport> reports(dd_manager_.data_dirs().size());
   vector<Status> statuses(dd_manager_.data_dirs().size());
   int i = 0;
   for (const auto& dd : dd_manager_.data_dirs()) {
@@ -1366,6 +1529,7 @@ Status LogBlockManager::Open() {
         Bind(&LogBlockManager::OpenDataDir,
              Unretained(this),
              dd.get(),
+             &reports[i],
              &statuses[i]));
     i++;
   }
@@ -1380,6 +1544,17 @@ Status LogBlockManager::Open() {
     if (!s.ok()) {
       return s;
     }
+  }
+
+  // Merge the reports and either return or log the result.
+  FsReport merged_report;
+  for (const auto& r : reports) {
+    merged_report.MergeFrom(r);
+  }
+  if (report) {
+    *report = std::move(merged_report);
+  } else {
+    RETURN_NOT_OK(merged_report.LogAndCheckForFatalErrors());
   }
 
   return Status::OK();
@@ -1406,7 +1581,7 @@ Status LogBlockManager::CreateBlock(const CreateBlockOptions& opts,
 
   block->reset(new internal::LogWritableBlock(container,
                                               new_block_id,
-                                              container->total_bytes_written()));
+                                              container->next_block_offset()));
   VLOG(3) << "Created block " << (*block)->id() << " in container "
           << container->ToString();
   return Status::OK();
@@ -1443,6 +1618,7 @@ Status LogBlockManager::DeleteBlock(const BlockId& block_id) {
   }
   VLOG(3) << "Deleting block " << block_id;
   lb->Delete();
+  lb->container()->BlockDeleted(lb);
 
   // Record the on-disk deletion.
   //
@@ -1491,7 +1667,7 @@ Status LogBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
 
 void LogBlockManager::AddNewContainerUnlocked(LogBlockContainer* container) {
   DCHECK(lock_.is_locked());
-  all_containers_.push_back(container);
+  InsertOrDie(&all_containers_by_name_, container->ToString(), container);
   if (metrics()) {
     metrics()->containers->Increment();
     if (container->full()) {
@@ -1580,15 +1756,19 @@ bool LogBlockManager::TryUseBlockId(const BlockId& block_id) {
   return InsertIfNotPresent(&open_block_ids_, block_id);
 }
 
-bool LogBlockManager::AddLogBlock(LogBlockContainer* container,
-                                  const BlockId& block_id,
-                                  int64_t offset,
-                                  int64_t length) {
+scoped_refptr<LogBlock> LogBlockManager::AddLogBlock(
+    LogBlockContainer* container,
+    const BlockId& block_id,
+    int64_t offset,
+    int64_t length) {
   std::lock_guard<simple_spinlock> l(lock_);
   scoped_refptr<LogBlock> lb(new LogBlock(container, block_id, offset, length));
   mem_tracker_->Consume(kudu_malloc_usable_size(lb.get()));
 
-  return AddLogBlockUnlocked(lb);
+  if (AddLogBlockUnlocked(lb)) {
+    return lb;
+  }
+  return nullptr;
 }
 
 bool LogBlockManager::AddLogBlockUnlocked(const scoped_refptr<LogBlock>& lb) {
@@ -1631,8 +1811,26 @@ scoped_refptr<LogBlock> LogBlockManager::RemoveLogBlock(const BlockId& block_id)
 }
 
 void LogBlockManager::OpenDataDir(DataDir* dir,
+                                  FsReport* report,
                                   Status* result_status) {
+  FsReport local_report;
+  local_report.data_dirs.push_back(dir->dir());
+
+  // We are going to perform these checks.
+  //
+  // Note: this isn't necessarily the complete set of FsReport checks; there
+  // may be checks that the LBM cannot perform.
+  local_report.full_container_space_check.emplace();
+  local_report.incomplete_container_check.emplace();
+  local_report.malformed_record_check.emplace();
+  local_report.misaligned_block_check.emplace();
+  local_report.partial_record_check.emplace();
+
+  // Keep track of deleted blocks that we may need to repunch.
+  vector<scoped_refptr<internal::LogBlock>> need_repunching;
+
   // Find all containers and open them.
+  unordered_set<string> containers_seen;
   vector<string> children;
   Status s = env_->GetChildren(dir->dir(), &children);
   if (!s.ok()) {
@@ -1641,32 +1839,32 @@ void LogBlockManager::OpenDataDir(DataDir* dir,
     return;
   }
   for (const string& child : children) {
-    string id;
-    if (!TryStripSuffixString(child, LogBlockManager::kContainerMetadataFileSuffix, &id)) {
+    string container_name;
+    if (!TryStripSuffixString(
+            child, LogBlockManager::kContainerDataFileSuffix, &container_name) &&
+        !TryStripSuffixString(
+            child, LogBlockManager::kContainerMetadataFileSuffix, &container_name)) {
       continue;
     }
+    if (!InsertIfNotPresent(&containers_seen, container_name)) {
+      continue;
+    }
+
     unique_ptr<LogBlockContainer> container;
-    s = LogBlockContainer::Open(this, dir, id, &container);
+    s = LogBlockContainer::Open(
+        this, dir, &local_report, container_name, &container);
     if (s.IsAborted()) {
-      // Skip the container. Open() already handled logging for us.
+      // Skip the container. Open() added a record of it to 'local_report' for us.
       continue;
     }
     if (!s.ok()) {
       *result_status = s.CloneAndPrepend(Substitute(
-          "Could not open container $0", id));
+          "Could not open container $0", container_name));
       return;
     }
 
-    // Populate the in-memory block maps using each container's records.
-    deque<BlockRecordPB> records;
-    s = container->ReadContainerRecords(&records);
-    if (!s.ok()) {
-      *result_status = s.CloneAndPrepend(Substitute(
-          "Could not read records from container $0", container->ToString()));
-      return;
-    }
-
-    // Process the records, building a container-local map.
+    // Process the records, building a container-local map for live blocks and
+    // a list of dead blocks.
     //
     // It's important that we don't try to add these blocks to the global map
     // incrementally as we see each record, since it's possible that one container
@@ -1679,30 +1877,83 @@ void LogBlockManager::OpenDataDir(DataDir* dir,
     // NOTE: Since KUDU-1538, we allocate sequential block IDs, which makes reuse
     // exceedingly unlikely. However, we might have old data which still exhibits
     // the above issue.
-    UntrackedBlockMap blocks_in_container;
+    UntrackedBlockMap live_blocks;
+    vector<scoped_refptr<internal::LogBlock>> dead_blocks;
     uint64_t max_block_id = 0;
-    for (const BlockRecordPB& r : records) {
-      s = ProcessBlockRecord(r, container.get(), &blocks_in_container);
-      if (!s.ok()) {
-        *result_status = s.CloneAndPrepend(Substitute(
-            "Could not process record in container $0", container->ToString()));
-        return;
-      }
-      max_block_id = std::max(max_block_id, r.block_id().id());
+    s = container->ProcessRecords(&local_report,
+                                  &live_blocks,
+                                  &dead_blocks,
+                                  &max_block_id);
+    if (!s.ok()) {
+      *result_status = s.CloneAndPrepend(Substitute(
+          "Could not process records in container $0", container->ToString()));
+      return;
     }
 
-    // Having processed the block records, it is now safe to truncate the
-    // preallocated space off of the end of the container. This is a no-op for
-    // non-full containers, where excess preallocated space is expected to be
-    // (eventually) used.
-    if (!read_only_) {
-      s = container->TruncateDataToTotalBytesWritten();
-      if (!s.ok()) {
-        *result_status = s.CloneAndPrepend(Substitute(
-            "Could not truncate container $0", container->ToString()));
-        return;
+    // With deleted blocks out of the way, check for misaligned blocks.
+    //
+    // We could also enforce that the record's offset is aligned with the
+    // underlying filesystem's block size, an invariant maintained by the log
+    // block manager. However, due to KUDU-1793, that invariant may have been
+    // broken, so we'll note but otherwise allow it.
+    for (const auto& e : live_blocks) {
+      if (PREDICT_FALSE(e.second->offset() %
+                        container->instance()->filesystem_block_size_bytes() != 0)) {
+        local_report.misaligned_block_check->entries.emplace_back(
+            container->ToString(), e.first);
+
       }
     }
+
+    // Having processed the block records, let's check whether any full
+    // containers have any extra space (left behind after a crash or from an
+    // older version of Kudu).
+    if (container->full()) {
+      // Filesystems are unpredictable beasts and may misreport the amount of
+      // space allocated to a file in various interesting ways. Some examples:
+      // - XFS's speculative preallocation feature may artificially enlarge the
+      //   container's data file without updating its file size. This makes the
+      //   file size untrustworthy for the purposes of measuring allocated space.
+      //   See KUDU-1856 for more details.
+      // - On el6.6/ext4 a container data file that consumed ~32K according to
+      //   its extent tree was actually reported as consuming an additional fs
+      //   block (2k) of disk space. A similar container data file (generated
+      //   via the same workload) on Ubuntu 16.04/ext4 did not exhibit this.
+      //   The suspicion is that older versions of ext4 include interior nodes
+      //   of the extent tree when reporting file block usage.
+      //
+      // To deal with these issues, our extra space cleanup code (deleted block
+      // repunching and container truncation) is gated on an "actual disk space
+      // consumed" heuristic. To prevent unnecessary triggering of the
+      // heuristic, we allow for some slop in our size measurements. The exact
+      // amount of slop is configurable via
+      // log_container_excess_space_before_cleanup_fraction.
+      //
+      // Too little slop and we'll do unnecessary work at startup. Too much and
+      // more unused space may go unreclaimed.
+      string data_filename = StrCat(container->ToString(), kContainerDataFileSuffix);
+      uint64_t reported_size;
+      s = env_->GetFileSizeOnDisk(data_filename, &reported_size);
+      if (!s.ok()) {
+        *result_status = s.CloneAndPrepend(Substitute(
+            "Could not get on-disk file size of container $0", container->ToString()));
+        return;
+      }
+      int64_t cleanup_threshold_size = container->live_bytes_aligned() *
+          (1 + FLAGS_log_container_excess_space_before_cleanup_fraction);
+      if (reported_size > cleanup_threshold_size) {
+        local_report.full_container_space_check->entries.emplace_back(
+            container->ToString(), reported_size - container->live_bytes_aligned());
+        need_repunching.insert(need_repunching.end(),
+                               dead_blocks.begin(), dead_blocks.end());
+      }
+
+      local_report.stats.lbm_full_container_count++;
+    }
+    local_report.stats.live_block_bytes += container->live_bytes();
+    local_report.stats.live_block_bytes_aligned += container->live_bytes_aligned();
+    local_report.stats.live_block_count += container->live_blocks();
+    local_report.stats.lbm_container_count++;
 
     next_block_id_.StoreMax(max_block_id + 1);
 
@@ -1714,8 +1965,9 @@ void LogBlockManager::OpenDataDir(DataDir* dir,
       // memory in a local and add it to the mem-tracker in a single increment
       // at the end of this loop.
       int64_t mem_usage = 0;
-      for (const UntrackedBlockMap::value_type& e : blocks_in_container) {
+      for (const UntrackedBlockMap::value_type& e : live_blocks) {
         if (!AddLogBlockUnlocked(e.second)) {
+          // TODO(adar): track as an inconsistency?
           LOG(FATAL) << "Found duplicate CREATE record for block " << e.first
                      << " which already is alive from another container when "
                      << " processing container " << container->ToString();
@@ -1729,51 +1981,135 @@ void LogBlockManager::OpenDataDir(DataDir* dir,
     }
   }
 
+  // Like the rest of Open(), repairs are performed per data directory to take
+  // advantage of parallelism.
+  s = Repair(&local_report, std::move(need_repunching));
+  if (!s.ok()) {
+    *result_status = s.CloneAndPrepend(Substitute(
+        "fatal error while repairing inconsistencies in data directory $0",
+        dir->dir()));
+    return;
+  }
+
+  *report = std::move(local_report);
   *result_status = Status::OK();
 }
 
-Status LogBlockManager::ProcessBlockRecord(const BlockRecordPB& record,
-                                           LogBlockContainer* container,
-                                           UntrackedBlockMap* block_map) {
-  BlockId block_id(BlockId::FromPB(record.block_id()));
-  switch (record.op_type()) {
-    case CREATE: {
-      scoped_refptr<LogBlock> lb(new LogBlock(container, block_id,
-                                              record.offset(), record.length()));
-      if (!InsertIfNotPresent(block_map, block_id, lb)) {
-        return Status::Corruption(Substitute(
-            "found duplicate CREATE record for block $0 in container $1: $2",
-            block_id.ToString(), container->ToString(), SecureDebugString(record)));
-      }
-
-      VLOG(2) << Substitute("Found CREATE block $0 at offset $1 with length $2",
-                            block_id.ToString(),
-                            record.offset(), record.length());
-
-      // This block must be included in the container's logical size, even if
-      // it has since been deleted. This helps satisfy one of our invariants:
-      // once a container byte range has been used, it may never be reused in
-      // the future.
-      //
-      // If we ignored deleted blocks, we would end up reusing the space
-      // belonging to the last deleted block in the container.
-      container->UpdateBytesWrittenAndTotalBlocks(record.offset(),
-                                                  record.length());
-      break;
-    }
-    case DELETE:
-      if (block_map->erase(block_id) != 1) {
-        return Status::Corruption(Substitute(
-            "Found DELETE record for invalid block $0 in container $1: $2",
-            block_id.ToString(), container->ToString(), SecureDebugString(record)));
-      }
-      VLOG(2) << Substitute("Found DELETE block $0", block_id.ToString());
-      break;
-    default:
-      return Status::Corruption(Substitute(
-          "Found unknown op type in container $0: $1",
-          container->ToString(), SecureDebugString(record)));
+Status LogBlockManager::Repair(
+    FsReport* report,
+    vector<scoped_refptr<internal::LogBlock>> need_repunching) {
+  if (read_only_) {
+    LOG(INFO) << "Read-only block manager, skipping repair";
+    return Status::OK();
   }
+  if (report->HasFatalErrors()) {
+    LOG(WARNING) << "Found fatal and irreparable errors, skipping repair";
+    return Status::OK();
+  }
+
+  // From here on out we're committed to repairing.
+
+  // Fetch all the containers we're going to need.
+  unordered_map<std::string, internal::LogBlockContainer*> containers_by_name;
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    if (report->partial_record_check) {
+      for (const auto& pr : report->partial_record_check->entries) {
+        containers_by_name[pr.container] =
+            FindOrDie(all_containers_by_name_, pr.container);
+      }
+    }
+    if (report->full_container_space_check) {
+      for (const auto& fcp : report->full_container_space_check->entries) {
+        containers_by_name[fcp.container] =
+            FindOrDie(all_containers_by_name_, fcp.container);
+      }
+    }
+  }
+
+  // Truncate partial metadata records.
+  //
+  // This is a fatal inconsistency; if the repair fails, we cannot proceed.
+  if (report->partial_record_check) {
+    for (auto& pr : report->partial_record_check->entries) {
+      unique_ptr<RWFile> file;
+      RWFileOptions opts;
+      opts.mode = Env::OPEN_EXISTING;
+      internal::LogBlockContainer* container = FindOrDie(containers_by_name,
+                                                         pr.container);
+      RETURN_NOT_OK_PREPEND(
+          env_->NewRWFile(opts,
+                          StrCat(pr.container, kContainerMetadataFileSuffix),
+                          &file),
+          "could not reopen container to truncate partial metadata record");
+
+      RETURN_NOT_OK_PREPEND(file->Truncate(pr.offset),
+                            "could not truncate partial metadata record");
+
+      // Technically we've "repaired" the inconsistency if the truncation
+      // succeeded, even if the following logic fails.
+      pr.repaired = true;
+
+      RETURN_NOT_OK_PREPEND(
+          file->Close(),
+          "could not close container after truncating partial metadata record");
+
+      // Reopen the PB writer so that it will refresh its metadata about the
+      // underlying file and resume appending to the new end of the file.
+      RETURN_NOT_OK_PREPEND(
+          container->ReopenMetadataWriter(),
+          "could not reopen container metadata file");
+    }
+  }
+
+  // Delete any incomplete container files.
+  //
+  // This is a non-fatal inconsistency; we can just as easily ignore the
+  // leftover container files.
+  if (report->incomplete_container_check) {
+    for (auto& ic : report->incomplete_container_check->entries) {
+      Status s = env_->DeleteFile(
+          StrCat(ic.container, kContainerMetadataFileSuffix));
+      if (!s.ok() && !s.IsNotFound()) {
+        WARN_NOT_OK(s, "could not delete incomplete container metadata file");
+      }
+
+      s = env_->DeleteFile(StrCat(ic.container, kContainerDataFileSuffix));
+      if (!s.ok() && !s.IsNotFound()) {
+        WARN_NOT_OK(s, "could not delete incomplete container data file");
+      }
+      ic.repaired = true;
+    }
+  }
+
+  // Truncate any excess preallocated space in full containers.
+  //
+  // This is a non-fatal inconsistency; we can just as easily ignore the extra
+  // disk space consumption.
+  if (report->full_container_space_check) {
+    for (auto& fcp : report->full_container_space_check->entries) {
+      internal::LogBlockContainer* container = FindOrDie(containers_by_name,
+                                                         fcp.container);
+      Status s = container->TruncateDataToNextBlockOffset();
+      if (s.ok()) {
+        fcp.repaired = true;
+      }
+      WARN_NOT_OK(s, "could not truncate excess preallocated space");
+    }
+  }
+
+  // Repunch all requested holes. Any excess space reclaimed was already
+  // tracked by LBMFullContainerSpaceCheck.
+  //
+  // TODO(adar): can be more efficient (less fs work and more space reclamation
+  // in case of misaligned blocks) via hole coalescing first, but this is easy.
+  for (const auto& b : need_repunching) {
+    b->Delete();
+  }
+
+  // Clearing this vector drops the last references to the LogBlocks within,
+  // triggering the repunching operations.
+  need_repunching.clear();
 
   return Status::OK();
 }

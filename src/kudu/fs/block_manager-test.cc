@@ -22,6 +22,7 @@
 
 #include "kudu/fs/file_block_manager.h"
 #include "kudu/fs/fs.pb.h"
+#include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
@@ -45,15 +46,11 @@ using strings::Substitute;
 
 DECLARE_uint64(log_container_preallocate_bytes);
 DECLARE_uint64(log_container_max_size);
-
 DECLARE_int64(fs_data_dirs_reserved_bytes);
 DECLARE_int64(disk_reserved_bytes_free_for_testing);
-
 DECLARE_int32(fs_data_dirs_full_disk_cache_seconds);
-
 DECLARE_string(block_manager);
-
-DECLARE_double(env_inject_io_error_on_write_or_preallocate);
+DECLARE_double(env_inject_io_error);
 
 // Generic block manager metrics.
 METRIC_DECLARE_gauge_uint64(block_manager_blocks_open_reading);
@@ -89,7 +86,10 @@ class BlockManagerTest : public KuduTest {
 
   virtual void SetUp() OVERRIDE {
     CHECK_OK(bm_->Create());
-    CHECK_OK(bm_->Open());
+    // Pass in a report to prevent the block manager from logging
+    // unnecessarily.
+    FsReport report;
+    CHECK_OK(bm_->Open(&report));
   }
 
  protected:
@@ -111,7 +111,8 @@ class BlockManagerTest : public KuduTest {
     if (create) {
       RETURN_NOT_OK(bm_->Create());
     }
-    return bm_->Open();
+    RETURN_NOT_OK(bm_->Open(nullptr));
+    return Status::OK();
   }
 
   void RunMultipathTest(const vector<string>& paths);
@@ -125,7 +126,10 @@ template <>
 void BlockManagerTest<LogBlockManager>::SetUp() {
   RETURN_NOT_LOG_BLOCK_MANAGER();
   CHECK_OK(bm_->Create());
-  CHECK_OK(bm_->Open());
+  // Pass in a report to prevent the block manager from logging
+  // unnecessarily.
+  FsReport report;
+  CHECK_OK(bm_->Open(&report));
 }
 
 template <>
@@ -251,10 +255,22 @@ TYPED_TEST(BlockManagerTest, EndToEndTest) {
   uint64_t sz;
   ASSERT_OK(read_block->Size(&sz));
   ASSERT_EQ(test_data.length(), sz);
-  Slice data;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[test_data.length()]);
-  ASSERT_OK(read_block->Read(0, test_data.length(), &data, scratch.get()));
+  uint8_t scratch[test_data.length()];
+  Slice data(scratch, test_data.length());
+  ASSERT_OK(read_block->Read(0, &data));
   ASSERT_EQ(test_data, data);
+
+  // Read the data back into multiple slices
+  size_t size1 = 5;
+  uint8_t scratch1[size1];
+  Slice data1(scratch1, size1);
+  size_t size2 = 4;
+  uint8_t scratch2[size2];
+  Slice data2(scratch2, size2);
+  vector<Slice> results = { data1, data2 };
+  ASSERT_OK(read_block->ReadV(0, &results));
+  ASSERT_EQ(test_data.substr(0, size1), data1);
+  ASSERT_EQ(test_data.substr(size1, size2), data2);
 
   // We don't actually do anything with the result of this call; we just want
   // to make sure it doesn't trigger a crash (see KUDU-1931).
@@ -284,9 +300,9 @@ TYPED_TEST(BlockManagerTest, ReadAfterDeleteTest) {
               .IsNotFound());
 
   // But we should still be able to read from the opened block.
-  Slice data;
   gscoped_ptr<uint8_t[]> scratch(new uint8_t[test_data.length()]);
-  ASSERT_OK(read_block->Read(0, test_data.length(), &data, scratch.get()));
+  Slice data(scratch.get(), test_data.length());
+  ASSERT_OK(read_block->Read(0, &data));
   ASSERT_EQ(test_data, data);
 }
 
@@ -463,7 +479,7 @@ TYPED_TEST(BlockManagerTest, PersistenceTest) {
       scoped_refptr<MetricEntity>(),
       MemTracker::CreateTracker(-1, "other tracker"),
       { this->test_dir_ }));
-  ASSERT_OK(new_bm->Open());
+  ASSERT_OK(new_bm->Open(nullptr));
 
   // Test that the state of all three blocks is properly reflected.
   unique_ptr<ReadableBlock> read_block;
@@ -475,9 +491,9 @@ TYPED_TEST(BlockManagerTest, PersistenceTest) {
   ASSERT_OK(new_bm->OpenBlock(written_block2->id(), &read_block));
   ASSERT_OK(read_block->Size(&sz));
   ASSERT_EQ(test_data.length(), sz);
-  Slice data;
   gscoped_ptr<uint8_t[]> scratch(new uint8_t[test_data.length()]);
-  ASSERT_OK(read_block->Read(0, test_data.length(), &data, scratch.get()));
+  Slice data(scratch.get(), test_data.length());
+  ASSERT_OK(read_block->Read(0, &data));
   ASSERT_EQ(test_data, data);
   ASSERT_OK(read_block->Close());
   ASSERT_TRUE(new_bm->OpenBlock(written_block3->id(), nullptr)
@@ -558,9 +574,9 @@ TYPED_TEST(BlockManagerTest, MetricsTest) {
         i * kTestData.length(), (i + 1) * kTestData.length()));
 
     // The read is reflected in total_bytes_read.
-    Slice data;
     gscoped_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
-    ASSERT_OK(reader->Read(0, kTestData.length(), &data, scratch.get()));
+    Slice data(scratch.get(), kTestData.length());
+    ASSERT_OK(reader->Read(0, &data));
     ASSERT_NO_FATAL_FAILURE(CheckMetrics(
         entity, 1, 0, i + 1, i + 1,
         (i + 1) * kTestData.length(), (i + 1) * kTestData.length()));
@@ -651,7 +667,7 @@ TYPED_TEST(BlockManagerTest, TestMetadataOkayDespiteFailedWrites) {
   FLAGS_log_container_preallocate_bytes = 8 * 1024;
 
   // Force some file operations to fail.
-  FLAGS_env_inject_io_error_on_write_or_preallocate = 0.2;
+  FLAGS_env_inject_io_error = 0.2;
 
   // Creates a block, writing the result to 'out' on success.
   auto create_a_block = [&](BlockId* out) -> Status {
@@ -675,8 +691,8 @@ TYPED_TEST(BlockManagerTest, TestMetadataOkayDespiteFailedWrites) {
 
     for (int i = 0; i < kNumAppends; i++) {
       uint8_t buf[kTestData.size()];
-      Slice s;
-      RETURN_NOT_OK(block->Read(i * kNumAppends, sizeof(buf), &s, buf));
+      Slice s(buf, kTestData.size());
+      RETURN_NOT_OK(block->Read(i * kNumAppends, &s));
       CHECK_EQ(kTestData, s);
     }
     return Status::OK();

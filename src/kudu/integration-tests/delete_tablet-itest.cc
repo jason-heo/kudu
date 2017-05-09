@@ -23,14 +23,14 @@
 #include "kudu/integration-tests/mini_cluster-itest-base.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/mini_master.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 
 DECLARE_int64(fs_wal_dir_reserved_bytes);
 
-using kudu::tablet::TabletPeer;
+using kudu::tablet::TabletReplica;
 using std::vector;
 
 namespace kudu {
@@ -47,20 +47,19 @@ TEST_F(DeleteTabletITest, TestDeleteFailedReplica) {
 
   std::unordered_map<std::string, itest::TServerDetails*> ts_map;
   ValueDeleter del(&ts_map);
-  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
+  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy(),
                                          cluster_->messenger(),
                                          &ts_map));
   auto* mts = cluster_->mini_tablet_server(0);
   auto* ts = ts_map[mts->uuid()];
 
-  scoped_refptr<TabletPeer> tablet_peer;
-  AssertEventually([&] {
-    vector<scoped_refptr<TabletPeer>> tablet_peers;
-    mts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-    ASSERT_EQ(1, tablet_peers.size());
-    tablet_peer = tablet_peers[0];
+  scoped_refptr<TabletReplica> tablet_replica;
+  ASSERT_EVENTUALLY([&] {
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    mts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(1, tablet_replicas.size());
+    tablet_replica = tablet_replicas[0];
   });
-  NO_FATALS();
 
   workload.Start();
   while (workload.rows_inserted() < 100) {
@@ -69,7 +68,7 @@ TEST_F(DeleteTabletITest, TestDeleteFailedReplica) {
   workload.StopAndJoin();
 
   // We need blocks on-disk for this regression test, so force an MRS flush.
-  ASSERT_OK(tablet_peer->tablet()->Flush());
+  ASSERT_OK(tablet_replica->tablet()->Flush());
 
   // Shut down the master so it doesn't crash the test process when we make the
   // disk appear to be full.
@@ -86,20 +85,20 @@ TEST_F(DeleteTabletITest, TestDeleteFailedReplica) {
 
   // Tablet bootstrap failure should result in tablet status == FAILED.
   {
-    vector<scoped_refptr<TabletPeer>> tablet_peers;
-    mts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-    ASSERT_EQ(1, tablet_peers.size());
-    tablet_peer = tablet_peers[0];
-    ASSERT_EQ(tablet::FAILED, tablet_peer->state());
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    mts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(1, tablet_replicas.size());
+    tablet_replica = tablet_replicas[0];
+    ASSERT_EQ(tablet::FAILED, tablet_replica->state());
   }
 
   // We should still be able to delete the failed tablet.
-  ASSERT_OK(itest::DeleteTablet(ts, tablet_peer->tablet_id(), tablet::TABLET_DATA_DELETED,
+  ASSERT_OK(itest::DeleteTablet(ts, tablet_replica->tablet_id(), tablet::TABLET_DATA_DELETED,
                                 boost::none, MonoDelta::FromSeconds(30)));
-  AssertEventually([&] {
-    vector<scoped_refptr<TabletPeer>> tablet_peers;
-    mts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-    ASSERT_EQ(0, tablet_peers.size());
+  ASSERT_EVENTUALLY([&] {
+    vector<scoped_refptr<TabletReplica>> tablet_replicas;
+    mts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+    ASSERT_EQ(0, tablet_replicas.size());
   });
 }
 

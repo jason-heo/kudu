@@ -20,6 +20,7 @@
 #include "kudu/tserver/tablet_server-test-base.h"
 
 #include <string>
+#include <vector>
 
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid_util.h"
@@ -34,8 +35,6 @@
 namespace kudu {
 namespace tserver {
 
-using consensus::MinimumOpId;
-
 // Number of times to roll the log.
 static const int kNumLogRolls = 2;
 
@@ -48,23 +47,48 @@ class TabletCopyTest : public TabletServerTestBase {
     // to test that we are anchoring correctly. Since GenerateTestData() does a
     // Flush(), Log GC is allowed to eat the logs before we get around to
     // starting a tablet copy session.
-    tablet_peer_->log_anchor_registry()->Register(
-      MinimumOpId().index(), CURRENT_TEST_NAME(), &anchor_);
+    tablet_replica_->log_anchor_registry()->Register(
+        consensus::MinimumOpId().index(), CURRENT_TEST_NAME(), &anchor_);
     NO_FATALS(GenerateTestData());
   }
 
   virtual void TearDown() OVERRIDE {
-    ASSERT_OK(tablet_peer_->log_anchor_registry()->Unregister(&anchor_));
+    ASSERT_OK(tablet_replica_->log_anchor_registry()->Unregister(&anchor_));
     NO_FATALS(TabletServerTestBase::TearDown());
   }
 
  protected:
   // Grab the first column block we find in the SuperBlock.
   static BlockId FirstColumnBlockId(const tablet::TabletSuperBlockPB& superblock) {
+    DCHECK_GT(superblock.rowsets_size(), 0);
     const tablet::RowSetDataPB& rowset = superblock.rowsets(0);
+    DCHECK_GT(rowset.columns_size(), 0);
     const tablet::ColumnDataPB& column = rowset.columns(0);
-    const BlockIdPB& block_id_pb = column.block();
-    return BlockId::FromPB(block_id_pb);
+    return BlockId::FromPB(column.block());
+  }
+
+  // Return a vector of the blocks contained in the specified superblock (not
+  // including orphaned blocks).
+  static vector<BlockId> ListBlocks(const tablet::TabletSuperBlockPB& superblock) {
+    vector<BlockId> block_ids;
+    for (const auto& rowset : superblock.rowsets()) {
+      for (const auto& col : rowset.columns()) {
+        block_ids.emplace_back(col.block().id());
+      }
+      for (const auto& redos : rowset.redo_deltas()) {
+        block_ids.emplace_back(redos.block().id());
+      }
+      for (const auto& undos : rowset.undo_deltas()) {
+        block_ids.emplace_back(undos.block().id());
+      }
+      if (rowset.has_bloom_block()) {
+        block_ids.emplace_back(rowset.bloom_block().id());
+      }
+      if (rowset.has_adhoc_index_block()) {
+        block_ids.emplace_back(rowset.adhoc_index_block().id());
+      }
+    }
+    return block_ids;
   }
 
   // Check that the contents and CRC32C of a DataChunkPB are equal to a local buffer.
@@ -82,19 +106,19 @@ class TabletCopyTest : public TabletServerTestBase {
     LOG_TIMING(INFO, "Loading test data") {
       for (int row_id = 0; row_id < kNumLogRolls * kIncr; row_id += kIncr) {
         InsertTestRowsRemote(0, row_id, kIncr);
-        ASSERT_OK(tablet_peer_->tablet()->Flush());
-        ASSERT_OK(tablet_peer_->log()->AllocateSegmentAndRollOver());
+        ASSERT_OK(tablet_replica_->tablet()->Flush());
+        ASSERT_OK(tablet_replica_->log()->AllocateSegmentAndRollOver());
       }
     }
   }
 
   // Return the permananent_uuid of the local service.
   const std::string GetLocalUUID() const {
-    return tablet_peer_->permanent_uuid();
+    return tablet_replica_->permanent_uuid();
   }
 
   const std::string& GetTabletId() const {
-    return tablet_peer_->tablet()->tablet_id();
+    return tablet_replica_->tablet()->tablet_id();
   }
 
   // Read a block file from the file system fully into memory and return a
@@ -107,13 +131,8 @@ class TabletCopyTest : public TabletServerTestBase {
     uint64_t size = 0;
     RETURN_NOT_OK(block->Size(&size));
     scratch->resize(size);
-    RETURN_NOT_OK(block->Read(0, size, slice, scratch->data()));
-
-    // Since the mmap will go away on return, copy the data into scratch.
-    if (slice->data() != scratch->data()) {
-      memcpy(scratch->data(), slice->data(), slice->size());
-      *slice = Slice(scratch->data(), slice->size());
-    }
+    *slice = Slice(scratch->data(), size);
+    RETURN_NOT_OK(block->Read(0, slice));
     return Status::OK();
   }
 

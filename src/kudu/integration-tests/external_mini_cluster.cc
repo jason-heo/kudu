@@ -44,6 +44,7 @@
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/jsonreader.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
@@ -68,13 +69,15 @@ using strings::Substitute;
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
 
+DEFINE_bool(perf_record, false,
+            "Whether to run \"perf record --call-graph fp\" on each daemon in the cluster");
+
 namespace kudu {
 
 static const char* const kMasterBinaryName = "kudu-master";
 static const char* const kTabletServerBinaryName = "kudu-tserver";
 static const char* const kWildcardIpAddr = "0.0.0.0";
 static const char* const kLoopbackIpAddr = "127.0.0.1";
-static double kProcessStartTimeoutSeconds = 30.0;
 static double kTabletServerRegistrationTimeoutSeconds = 15.0;
 static double kMasterCatalogManagerTimeoutSeconds = 60.0;
 
@@ -91,14 +94,19 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       num_tablet_servers(1),
       bind_mode(kBindMode),
       enable_kerberos(false),
-      logtostderr(true) {
+      logtostderr(true),
+      start_process_timeout(MonoDelta::FromSeconds(30)) {
 }
 
 ExternalMiniClusterOptions::~ExternalMiniClusterOptions() {
 }
 
-ExternalMiniCluster::ExternalMiniCluster(const ExternalMiniClusterOptions& opts)
-  : opts_(opts) {
+ExternalMiniCluster::ExternalMiniCluster()
+  : opts_(ExternalMiniClusterOptions()) {
+}
+
+ExternalMiniCluster::ExternalMiniCluster(ExternalMiniClusterOptions opts)
+  : opts_(std::move(opts)) {
 }
 
 ExternalMiniCluster::~ExternalMiniCluster() {
@@ -264,7 +272,12 @@ Status ExternalMiniCluster::StartSingleMaster() {
   opts.exe = GetBinaryPath(kMasterBinaryName);
   opts.data_dir = GetDataPath(daemon_id);
   opts.log_dir = GetLogPath(daemon_id);
+  if (FLAGS_perf_record) {
+    opts.perf_record_filename =
+        Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
+  }
   opts.extra_flags = SubstituteInFlags(opts_.extra_master_flags, 0);
+  opts.start_process_timeout = opts_.start_process_timeout;
   scoped_refptr<ExternalMaster> master = new ExternalMaster(opts);
   if (opts_.enable_kerberos) {
     RETURN_NOT_OK_PREPEND(master->EnableKerberos(kdc_.get(), Substitute("$0", kLoopbackIpAddr)),
@@ -302,7 +315,12 @@ Status ExternalMiniCluster::StartDistributedMasters() {
     opts.exe = exe;
     opts.data_dir = GetDataPath(daemon_id);
     opts.log_dir = GetLogPath(daemon_id);
+    if (FLAGS_perf_record) {
+      opts.perf_record_filename =
+          Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
+    }
     opts.extra_flags = SubstituteInFlags(flags, i);
+    opts.start_process_timeout = opts_.start_process_timeout;
 
     scoped_refptr<ExternalMaster> peer = new ExternalMaster(opts, peer_addrs[i]);
     if (opts_.enable_kerberos) {
@@ -349,7 +367,12 @@ Status ExternalMiniCluster::AddTabletServer() {
   opts.exe = GetBinaryPath(kTabletServerBinaryName);
   opts.data_dir = GetDataPath(daemon_id);
   opts.log_dir = GetLogPath(daemon_id);
+  if (FLAGS_perf_record) {
+    opts.perf_record_filename =
+        Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
+  }
   opts.extra_flags = SubstituteInFlags(opts_.extra_tserver_flags, idx);
+  opts.start_process_timeout = opts_.start_process_timeout;
 
   scoped_refptr<ExternalTabletServer> ts =
       new ExternalTabletServer(opts, bind_host, master_hostports);
@@ -596,6 +619,8 @@ ExternalDaemon::ExternalDaemon(ExternalDaemonOptions opts)
     : messenger_(std::move(opts.messenger)),
       data_dir_(std::move(opts.data_dir)),
       log_dir_(std::move(opts.log_dir)),
+      perf_record_filename_(std::move(opts.perf_record_filename)),
+      start_process_timeout_(opts.start_process_timeout),
       logtostderr_(opts.logtostderr),
       exe_(std::move(opts.exe)),
       extra_flags_(std::move(opts.extra_flags)) {}
@@ -621,8 +646,9 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   CHECK(!process_);
 
   vector<string> argv;
-  // First the exe for argv[0]
-  argv.push_back(BaseName(exe_));
+
+  // First the exe for argv[0].
+  argv.push_back(exe_);
 
   // Then all the flags coming from the minicluster framework.
   argv.insert(argv.end(), user_flags.begin(), user_flags.end());
@@ -685,7 +711,8 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   // the previous info file if it's there.
   ignore_result(Env::Default()->DeleteFile(info_path));
 
-  gscoped_ptr<Subprocess> p(new Subprocess(exe_, argv));
+  // Start the daemon.
+  gscoped_ptr<Subprocess> p(new Subprocess(argv));
   p->ShareParentStdout(false);
   p->SetEnvVars(extra_env_);
   string env_str;
@@ -695,11 +722,27 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   RETURN_NOT_OK_PREPEND(p->Start(),
                         Substitute("Failed to start subprocess $0", exe_));
 
+  // If requested, start a monitoring subprocess.
+  unique_ptr<Subprocess> perf_record;
+  if (!perf_record_filename_.empty()) {
+    perf_record.reset(new Subprocess({
+      "perf",
+      "record",
+      "--call-graph",
+      "fp",
+      "-o",
+      perf_record_filename_,
+      Substitute("--pid=$0", p->pid())
+    }, SIGINT));
+    RETURN_NOT_OK_PREPEND(perf_record->Start(),
+                          "Could not start perf record subprocess");
+  }
+
   // The process is now starting -- wait for the bound port info to show up.
   Stopwatch sw;
   sw.start();
   bool success = false;
-  while (sw.elapsed().wall_seconds() < kProcessStartTimeoutSeconds) {
+  while (sw.elapsed().wall_seconds() < start_process_timeout_.ToSeconds()) {
     if (Env::Default()->FileExists(info_path)) {
       success = true;
       break;
@@ -716,6 +759,7 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
     // and exit as if it had succeeded.
     if (WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == fault_injection::kExitStatus) {
       process_.swap(p);
+      perf_record_process_.swap(perf_record);
       return Status::OK();
     }
 
@@ -729,7 +773,7 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
     ignore_result(p->Kill(SIGKILL));
     return Status::TimedOut(
         Substitute("Timed out after $0s waiting for process ($1) to write info file ($2)",
-                   kProcessStartTimeoutSeconds, exe_, info_path));
+                   start_process_timeout_.ToString(), exe_, info_path));
   }
 
   status_.reset(new ServerStatusPB());
@@ -739,6 +783,7 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   VLOG(1) << exe_ << " instance information:\n" << SecureDebugString(*status_);
 
   process_.swap(p);
+  perf_record_process_.swap(perf_record);
   return Status::OK();
 }
 
@@ -861,6 +906,7 @@ void ExternalDaemon::Shutdown() {
   WARN_NOT_OK(process_->Wait(), "Waiting on " + exe_);
   paused_ = false;
   process_.reset();
+  perf_record_process_.reset();
 }
 
 void ExternalDaemon::FlushCoverage() {
